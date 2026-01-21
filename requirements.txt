@@ -1,16 +1,16 @@
 # Multi-Body Dynamics Preprocessor Dependencies
 
 # CAD kernel and 3D visualization
-pythonocc-core
+pythonocc-core=7.9.0
 
 # GUI framework
-PySide6>=6.0.0
+PySide6=6.10.1
 
 # Numerical computing
-numpy>=1.21.0
+numpy=2.2.6
 
 # Scientific computing (convex hull generation)
-scipy>=1.7.0
+scipy=1.15.3
 
 # Mesh operations
-trimesh>=3.9.0
+trimesh=4.11.0
