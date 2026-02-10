@@ -1,6 +1,9 @@
 # Multi-Body Dynamics Preprocessor
 
 A desktop application for preparing CAD assemblies for multi-body dynamics simulations. Load STEP files, define rigid bodies, create joints, and export to simulation-ready formats.
+Here is a demo :
+
+https://www.linkedin.com/posts/utkarsh-kulkarni-737a21143_python-mbd-simulation-activity-7417465950595358720-Bytp?utm_source=share&utm_medium=member_desktop&rcm=ACoAACLbVNsBFxFMNDgH9pOH3QkAD194cmSTt6s
 
 ![Python](https://img.shields.io/badge/Python-3.8+-blue.svg)
 ![PySide6](https://img.shields.io/badge/GUI-PySide6-green.svg)
