@@ -26,49 +26,27 @@ The goal is to help developers understand the **end-to-end behavior** and the **
 
 ```mermaid
 graph TD
-    subgraph "User Interface Layer"
-        A[MainWindow<br/>Orchestrator / Controller]
-        C[BodyTreeWidget<br/>Selection & Structure]
-        D[PropertyPanel<br/>Inspection & Commands]
-        V[View Menu<br/>Camera Snapping]
-    end
+    Main[MainWindow] --> Viewer[SelectableViewer3d]
+    Main --> Tree[BodyTreeWidget]
+    Main --> Panel[PropertyPanel]
+    Main --> ViewMenu[View Menu for Snaps]
 
-    subgraph "Input & Interaction Layer"
-        B[SelectableViewer3d<br/>Mouse Events, Picking, Camera]
-    end
+    Viewer --> BodyR[BodyRenderer]
+    Viewer --> SubR[Face/Edge/Vertex Renderers]
+    Viewer --> OtherR[Other Renderers]
 
-    subgraph "Visualization Layer"
-        E[BodyRenderer<br/>Body AIS + Pose-driven Local Transforms]
-        F[Face/Edge/VertexRenderers<br/>Sub-shape Highlights (synced to pose)]
-        FR[FrameRenderer + Others]
-    end
+    Main --> State[State - Mutable Poses]
+    State --> BodyR
+    State --> SubR
 
-    subgraph "Domain Model Layer"
-        G[State<br/>Mutable Source of Truth<br/>assembly_pose + body_poses[ id -> Pose ]]
-        H[Pose<br/>origin + rotation_matrix]
-        I[RigidBody Collection<br/>id, shape (immutable), local_frame, .state ref]
-    end
+    Bodies[RigidBody List] --> State
+    Bodies -. references .-> State
 
-    subgraph "Background Processing"
-        K[StepLoadWorker QThread<br/>Non-blocking Load + Physics]
-        L[StepParser + PhysicsCalculator]
-    end
+    Main --> Worker[StepLoadWorker Thread]
+    Worker --> Parser[StepParser]
+    Worker --> Physics[PhysicsCalculator]
 
-    A --> B
-    A --> C
-    A --> D
-    A --> V
-    B --> E
-    B --> F
-    B --> FR
-    A --> G
-    G --> E
-    G --> F
-    I --> G
-    A --> K
-    K --> L
-    E --> M[gp_Trsf + SetLocalTransformation<br/>on AIS_Shape]
-    I -. "references" .-> G
+    BodyR --> Transform[Apply gp_Trsf via SetLocalTransformation]
 ```
 
 **Systems Thinking Perspective**:
@@ -105,7 +83,7 @@ sequenceDiagram
     Dialog-->>Main: filepath
     Main->>Clear: _clear_ui_for_new_load()
     Main->>Main: setEnabled(False)
-    Main->>Worker: start()  [QThread]
+    Main->>Worker: start QThread
     
     Worker->>Parser: load_step_file()
     Parser-->>Worker: shape, unit_scale
@@ -197,27 +175,22 @@ This mapping creates a clear **separation of concerns** in the input layer: obje
 
 ```mermaid
 flowchart TD
-    A[Left Press on Body<br/>(mode==Body)] --> B[_get_body_id_at via OCC Select]
-    B --> C[_start_body_drag: record screen + world pos from State]
-    C --> D[on_body_drag_start → on_body_selected]
+    A[Left Press Body] --> B[Get Body ID via OCC]
+    B --> C[Start Drag Record Start Pos]
+    C --> D[Notify Selected]
     
-    E[Mouse Move while Left down] --> F[Pixel threshold dx²+dy² >= 3?]
-    F -->|Yes| G[_update_body_drag → _screen_delta_to_world_delta]
-    G --> H[Compute new_pos = start + view-plane delta]
-    H --> I[Store _pending_drag_pos]
+    E[Mouse Move Left] --> F[Threshold Check]
+    F -->|Yes| G[Calc View Delta]
+    G --> H[New World Pos]
+    H --> I[Queue Update]
     
-    J[QTimer ~16ms] --> K[_apply_pending_drag_update]
-    K --> L{||new_pos - last|| > 1e-5 ?}
-    L -->|Yes| M[State.set_body_pose(new_pos, current_rot)]
-    M --> N[body_renderer.update_body_transform]
-    N --> O[Compute delta_trsf = desired @ inv(base)]
-    O --> P[body_ais.SetLocalTransformation]
-    P --> Q[Redisplay(False) + UpdateCurrentViewer + Repaint]
-    Q --> R[_sync_highlight_transforms if face/edge/vertex selected on this body]
-    R --> S[Apply same trsf to highlight AIS]
+    J[Timer Tick] --> K[Apply if Changed]
+    K -->|Yes| L[Update State Pose]
+    L --> M[Apply Body Transform]
+    M --> N[Update Visuals]
+    N --> O[Sync Highlights]
     
-    T[Left Release] --> U[_end_body_drag: stop timer]
-    U --> V[One-time refresh of local_frame + COM marker]
+    P[Release] --> Q[End Drag Refresh UI]
 ```
 
 ### Detailed Explanation & Data Flow
@@ -299,9 +272,9 @@ sequenceDiagram
     C-->>V: SelectedInteractive
     V->>M: on_body_clicked(body_id)
     M->>M: on_body_selected(body_id)
-    M->>R: highlight_body() → SetColor yellow
+    M->>R: highlight_body() -> SetColor yellow
     M->>P: show_body_properties()
-    P->>M: local_frame_checkbox → frame_renderer.render_frame()
+    P->>M: local_frame_checkbox -> frame_renderer.render_frame()
 ```
 
 **Important Detail**:
@@ -349,19 +322,16 @@ This design creates **loose coupling** between "what the body is" (geometry + lo
 
 ```mermaid
 flowchart LR
-    A[Delete Body] --> B[Remove connected Joints]
-    A --> C[Remove associated Frames via frame_to_body_map]
-    A --> D[Remove local_frame visual]
-    A --> E[body_renderer.remove_body]
-    A --> F[viewer.remove_from_mapping]
-    A --> G[Remove from properties maps]
-    A --> H[State.remove_body_pose]
-    A --> I[Update tree + repaint]
+    A[Delete Body] --> B[Cleanup Joints]
+    A --> C[Cleanup Frames]
+    A --> D[Remove Visuals]
+    A --> E[Remove from Renderer]
+    A --> F[Update UI]
 ```
 
 ---
 
-## 6. View Snapping (Axes + Isometric)
+## 7. View Snapping (Axes + Isometric)
 
 **User Action**: View menu → Top / Front / Isometric, etc.
 
@@ -379,7 +349,7 @@ This is a pure **view** operation — it does not touch `State` or any body pose
 
 ---
 
-## 7. Systems Thinking Perspective: How the Components Fit Together
+## 8. Systems Thinking Perspective: How the Components Fit Together
 
 The MBD Pre-Processor is best understood as a **socio-technical system** whose purpose is to let a human interactively define and explore the **mutable spatial configuration** of an assembly whose intrinsic geometry is fixed.
 
