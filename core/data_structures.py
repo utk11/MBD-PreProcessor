@@ -178,11 +178,14 @@ class Assembly:
     """
     Container for the multi-body system.
     Holds all bodies, joints, and user-defined frames.
+
+    The State (if attached) holds the live mutable poses for the assembly and bodies.
     """
     def __init__(self):
         self.bodies: Dict[int, RigidBody] = {}
         self.joints: Dict[str, Joint] = {}
         self.frames: Dict[str, Frame] = {}  # User-defined frames
+        self.state: Optional['State'] = None  # Optional shared mutable pose state
 
 
 class Frame:
@@ -270,6 +273,87 @@ class Frame:
         return f"Frame(name='{self.name}', origin={self.origin})"
 
 
+class Pose:
+    """Represents a mutable 6DOF pose (position + orientation).
+
+    Used by State to store the current placement of the assembly or individual bodies.
+    All values are in world (global) coordinates, in meters.
+    """
+
+    def __init__(self, origin: np.ndarray = None, rotation_matrix: np.ndarray = None):
+        """
+        Initialize a pose.
+
+        Args:
+            origin: 3D position [x, y, z] in meters (default: [0, 0, 0])
+            rotation_matrix: 3×3 rotation matrix (default: identity)
+        """
+        if origin is None:
+            self.origin = np.array([0.0, 0.0, 0.0])
+        else:
+            self.origin = np.array(origin, dtype=float).copy()
+
+        if rotation_matrix is None:
+            self.rotation_matrix = np.eye(3)
+        else:
+            self.rotation_matrix = np.array(rotation_matrix, dtype=float).copy()
+
+    def __repr__(self):
+        return f"Pose(origin=[{self.origin[0]:.4f}, {self.origin[1]:.4f}, {self.origin[2]:.4f}])"
+
+
+class State:
+    """Mutable container for the current positions and orientations of the assembly and bodies.
+
+    This is the single source of truth for interactive placement.
+    - assembly_pose: root transform for the whole assembly
+    - body_poses: per-body world poses (keyed by RigidBody.id)
+
+    RigidBody instances hold a reference to a State and query it for their current state.
+    The State is intended to be mutated (e.g. when the user drags a body).
+    """
+
+    def __init__(self):
+        self.assembly_pose: Pose = Pose()
+        self.body_poses: Dict[int, Pose] = {}
+
+    def set_assembly_pose(self, origin: np.ndarray, rotation_matrix: np.ndarray):
+        """Set the pose of the entire assembly."""
+        self.assembly_pose = Pose(origin, rotation_matrix)
+
+    def get_assembly_pose(self) -> Pose:
+        """Get the current assembly pose."""
+        return self.assembly_pose
+
+    def set_body_pose(self, body_id: int, origin: np.ndarray, rotation_matrix: np.ndarray):
+        """Set (or update) the world pose for a specific body."""
+        self.body_poses[body_id] = Pose(origin, rotation_matrix)
+
+    def get_body_pose(self, body_id: int) -> Optional[Pose]:
+        """Get the current world pose for a body, or None if not set."""
+        return self.body_poses.get(body_id)
+
+    def remove_body_pose(self, body_id: int):
+        """Remove a body's pose entry (used when deleting bodies)."""
+        if body_id in self.body_poses:
+            del self.body_poses[body_id]
+
+    def get_body_world_frame(self, body_id: int, name: Optional[str] = None) -> Optional['Frame']:
+        """Convenience helper: return the body's current pose as a Frame (for compatibility with existing code)."""
+        pose = self.get_body_pose(body_id)
+        if pose is None:
+            return None
+        frame_name = name if name else f"Body_{body_id}_WorldPose"
+        return Frame(
+            origin=pose.origin.copy(),
+            rotation_matrix=pose.rotation_matrix.copy(),
+            name=frame_name
+        )
+
+    def __repr__(self):
+        return f"State(assembly={self.assembly_pose}, body_ids={list(self.body_poses.keys())})"
+
+
 class RigidBody:
     """Represents a rigid body in the assembly"""
     
@@ -299,6 +383,37 @@ class RigidBody:
         
         # Contact detection property
         self.contact_enabled = True  # Enable contact detection by default
+
+        # Reference to the mutable State that holds this body's current position/orientation.
+        # Bodies consult self.state (via body_id) to obtain their live pose.
+        # This reference is set by the application after parsing (see MainWindow / State initialization).
+        self.state: Optional['State'] = None
         
+    def get_world_position(self) -> np.ndarray:
+        """Return the current world position of this body (from State if available).
+
+        Falls back to local_frame origin (COM) when no State is attached.
+        """
+        if self.state is not None:
+            pose = self.state.get_body_pose(self.id)
+            if pose is not None:
+                return pose.origin.copy()
+        if self.local_frame is not None:
+            return self.local_frame.origin.copy()
+        return np.array([0.0, 0.0, 0.0])
+
+    def get_world_rotation_matrix(self) -> np.ndarray:
+        """Return the current world orientation (rotation matrix) of this body.
+
+        Falls back to identity when no State pose is available.
+        """
+        if self.state is not None:
+            pose = self.state.get_body_pose(self.id)
+            if pose is not None:
+                return pose.rotation_matrix.copy()
+        if self.local_frame is not None:
+            return self.local_frame.rotation_matrix.copy()
+        return np.eye(3)
+
     def __repr__(self):
         return f"RigidBody(id={self.id}, name='{self.name}')"

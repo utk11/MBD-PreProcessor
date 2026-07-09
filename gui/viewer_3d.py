@@ -6,6 +6,7 @@ Increment 27: Vertex Selection
 """
 
 from typing import Optional, Callable, Dict, Tuple
+import numpy as np
 from PySide6.QtCore import Signal, QObject
 from OCC.Display.qtDisplay import qtViewer3d
 from OCC.Core.AIS import AIS_Shape
@@ -14,6 +15,7 @@ from OCC.Core.Quantity import Quantity_Color, Quantity_NOC_BLACK
 from OCC.Core.V3d import V3d_ZBUFFER
 from OCC.Core.TopAbs import TopAbs_FACE, TopAbs_EDGE, TopAbs_VERTEX
 from OCC.Core.TopoDS import TopoDS_Face, TopoDS_Edge, TopoDS_Vertex
+from OCC.Core.gp import gp_Vec
 from core.data_structures import RigidBody
 
 
@@ -60,6 +62,16 @@ class SelectableViewer3d(qtViewer3d):
 
         # Current selection mode
         self.selection_mode: str = "Body"  # "Body", "Face", "Edge", or "Vertex"
+
+        # --- Body dragging state (wired to State via MainWindow callbacks) ---
+        self._dragging_body_id: Optional[int] = None
+        self._drag_start_screen: Optional[Tuple[int, int]] = None
+        self._drag_start_world_pos: Optional[np.ndarray] = None
+
+        # Callbacks provided by MainWindow for drag interaction
+        self.on_body_drag_start: Optional[Callable[[int], None]] = None
+        self.on_body_drag_move: Optional[Callable[[int, np.ndarray], None]] = None  # body_id, new_world_pos (meters)
+        self.on_body_drag_end: Optional[Callable[[int], None]] = None
 
     def set_selection_mode(self, mode: str):
         """
@@ -119,26 +131,64 @@ class SelectableViewer3d(qtViewer3d):
         # Re-apply selection mode activation
         self.set_selection_mode(self.selection_mode)
 
+    def mousePressEvent(self, event):
+        """
+        Body dragging requires Ctrl + Left click (to keep normal left/right/middle free for camera controls).
+        """
+        from PySide6.QtCore import Qt
+
+        if event.button() == Qt.LeftButton and (event.modifiers() & Qt.ControlModifier):
+            if self.selection_mode != "Body":
+                self.set_selection_mode("Body")
+
+            pt = event.pos()
+            body_id = self._get_body_id_at(pt.x(), pt.y())
+            if body_id is not None:
+                self._start_body_drag(body_id, pt.x(), pt.y())
+                if self.on_body_clicked:
+                    self.on_body_clicked(body_id)
+            return
+
+        super().mousePressEvent(event)
+
+    def mouseMoveEvent(self, event):
+        """
+        Only intercept mouse moves when we are actively dragging a body (started with Ctrl+Left).
+        Otherwise let the base viewer handle camera controls (right/middle, and possibly left).
+        """
+        from PySide6.QtCore import Qt
+
+        if self._dragging_body_id is not None and (event.buttons() & Qt.LeftButton):
+            pt = event.pos()
+            self._update_body_drag(pt.x(), pt.y())
+            return  # consume only while body dragging
+
+        # All other cases (plain left, right, middle) go to base for camera / default
+        super().mouseMoveEvent(event)
+
     def mouseReleaseEvent(self, event):
         """
-        Handle mouse release events for selection
-
-        Args:
-            event: Mouse event
+        Left release: end drag or do body selection.
+        Right/Middle release: parent handles camera.
         """
         from PySide6.QtCore import Qt
 
         pt = event.pos()
         modifiers = event.modifiers()
 
-        # Handle left-click selection ourselves
         if event.button() == Qt.LeftButton:
-            if not self._select_area and modifiers == Qt.NoModifier:
-                # Single body selection - use our custom logic
-                self._select_at_position(pt.x(), pt.y())
-                return  # Don't call parent - we handled it
+            if self._dragging_body_id is not None:
+                self._end_body_drag()
+                # Consumed
+                return
 
-        # For all other cases, use parent's implementation
+            # Normal left-click selection on release (if not area select)
+            if not self._select_area and modifiers == Qt.NoModifier:
+                self._select_at_position(pt.x(), pt.y())
+            # Always consume left release
+            return
+
+        # Right or Middle release → parent camera handling
         super().mouseReleaseEvent(event)
 
     def _select_at_position(self, x: int, y: int):
@@ -490,3 +540,167 @@ class SelectableViewer3d(qtViewer3d):
                 del self.bodies_dict[body_id]
             
             print(f"Body {body_id} removed from viewer mappings")
+
+    # ------------------------------------------------------------------
+    # Body dragging support (translates bodies by updating State)
+    # ------------------------------------------------------------------
+
+    def _get_body_id_at(self, x: int, y: int) -> Optional[int]:
+        """Reliably return the body ID under the given screen position (if any), using the same logic as selection."""
+        dpr = float(self.devicePixelRatioF())
+        px = int(x * dpr)
+        py = int(y * dpr)
+
+        ctx = self._display.Context
+        view = self._display.View
+
+        # MoveTo for detection (like in selection)
+        ctx.MoveTo(px, py, view, False)
+
+        # Clear previous so we query fresh (like in _select_at_position)
+        ctx.ClearSelected(False)
+
+        # Perform selection at point (this populates SelectedInteractive reliably)
+        if ctx.HasDetected():
+            ctx.Select(True)
+        else:
+            ctx.Select(px, py, px, py, view, False)
+
+        # Now check what is selected, same as selection path
+        ctx.InitSelected()
+        if ctx.MoreSelected():
+            selected_ais = ctx.SelectedInteractive()
+            if selected_ais in self.ais_body_map:
+                return self.ais_body_map[selected_ais]
+
+            # Fallback equality check (rare)
+            for ais_shape, body_id in self.ais_body_map.items():
+                if ais_shape.IsEqual(selected_ais) or ais_shape == selected_ais:
+                    return body_id
+
+        return None
+
+    def _start_body_drag(self, body_id: int, screen_x: int, screen_y: int):
+        if body_id not in self.bodies_dict:
+            return
+        body = self.bodies_dict[body_id]
+        if getattr(body, "state", None) is None:
+            print(f"Cannot drag body {body_id}: no State attached")
+            return
+
+        self._dragging_body_id = body_id
+        self._drag_start_screen = (screen_x, screen_y)
+        self._last_drag_screen = (screen_x, screen_y)  # for threshold
+        try:
+            self._drag_start_world_pos = body.get_world_position().copy()
+        except Exception:
+            self._drag_start_world_pos = np.zeros(3)
+
+        print(f"Started dragging Body {body_id}")
+        from PySide6.QtCore import Qt
+        self.setCursor(Qt.SizeAllCursor)
+        if self.on_body_drag_start:
+            self.on_body_drag_start(body_id)
+
+    def _update_body_drag(self, screen_x: int, screen_y: int):
+        if self._dragging_body_id is None or self._drag_start_world_pos is None:
+            return
+
+        # Small movement threshold to avoid spamming updates on tiny mouse jitter.
+        # This significantly improves smoothness by reducing work per frame.
+        last_x, last_y = self._last_drag_screen
+        dx = screen_x - last_x
+        dy = screen_y - last_y
+        if (dx * dx + dy * dy) < 3:   # ~1.7 pixels squared threshold
+            return
+
+        self._last_drag_screen = (screen_x, screen_y)
+
+        body_id = self._dragging_body_id
+        try:
+            delta = self._screen_delta_to_world_delta(
+                self._drag_start_screen[0], self._drag_start_screen[1],
+                screen_x, screen_y,
+                self._drag_start_world_pos
+            )
+            new_pos = self._drag_start_world_pos + delta
+
+            if self.on_body_drag_move:
+                self.on_body_drag_move(body_id, new_pos)
+        except Exception as e:
+            print(f"Drag update error for body {body_id}: {e}")
+
+    def _end_body_drag(self):
+        body_id = self._dragging_body_id
+        self._dragging_body_id = None
+        self._drag_start_screen = None
+        self._drag_start_world_pos = None
+
+        if body_id is not None:
+            print(f"Finished dragging Body {body_id}")
+            self.unsetCursor()
+            if self.on_body_drag_end:
+                self.on_body_drag_end(body_id)
+
+    def _screen_delta_to_world_delta(self, start_x: int, start_y: int,
+                                     curr_x: int, curr_y: int,
+                                     ref_world_pos: np.ndarray) -> np.ndarray:
+        """Approximate world-space translation from screen pixel delta (parallel to view plane)."""
+        try:
+            # Projection direction
+            proj = self._display.View.Proj()
+            if isinstance(proj, (list, tuple)):
+                vdir = gp_Vec(proj[0], proj[1], proj[2])
+            else:
+                vdir = gp_Vec(proj.X(), proj.Y(), proj.Z())
+            vdir.Normalize()
+
+            # Up direction
+            up = self._display.View.Up()
+            if isinstance(up, (list, tuple)):
+                upv = gp_Vec(up[0], up[1], up[2])
+            else:
+                upv = gp_Vec(up.X(), up.Y(), up.Z())
+            upv.Normalize()
+
+            # Right vector (screen X)
+            rightv = upv.Crossed(vdir)
+            rightv.Normalize()
+
+            # Re-orthogonalize up (screen Y)
+            upv = vdir.Crossed(rightv)
+            upv.Normalize()
+
+            right = np.array([rightv.X(), rightv.Y(), rightv.Z()])
+            up = np.array([upv.X(), upv.Y(), upv.Z()])
+
+            # World units per pixel at the reference point.
+            # Use view size heuristic (robust across pythonocc versions).
+            # Size() usually gives a measure related to the view width in world units.
+            try:
+                view_size = float(self._display.View.Size())
+                if view_size < 1e-6:
+                    view_size = 1.0
+                w = max(float(self.width()), 1.0)
+                world_per_pixel = (view_size * 2.0) / w
+            except Exception:
+                world_per_pixel = 0.001
+
+            # Optional sensitivity tweak: for many assemblies this feels good.
+            # Increase if drag feels too slow, decrease if too fast.
+            world_per_pixel *= 1.0
+
+            dx = float(curr_x - start_x) * world_per_pixel
+            dy = float(curr_y - start_y) * world_per_pixel
+
+            # Screen +Y is downward → negate for world up
+            delta = right * dx - up * dy
+            return delta
+        except Exception as e:
+            print("Drag delta error, using fallback:", e)
+            scale = 0.001
+            return np.array([
+                scale * (curr_x - start_x),
+                -scale * (curr_y - start_y),
+                0.0
+            ])

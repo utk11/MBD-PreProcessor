@@ -3,7 +3,7 @@
 import sys
 from PySide6.QtWidgets import (QApplication, QMainWindow, QWidget, QVBoxLayout,
                                 QFileDialog, QMenuBar, QMessageBox, QSplitter, QDialog)
-from PySide6.QtCore import Qt
+from PySide6.QtCore import Qt, QTimer, QThread, Signal
 from PySide6.QtGui import QAction
 from typing import List, Optional, Dict, Tuple
 import numpy as np
@@ -14,7 +14,7 @@ load_backend('pyside6')
 
 # Import core modules
 from core.step_parser import StepParser
-from core.data_structures import RigidBody, Frame, Joint, JointType, Force, Torque, MotorType
+from core.data_structures import RigidBody, Frame, Joint, JointType, Force, Torque, MotorType, State, Pose
 from core.physics_calculator import PhysicsCalculator
 from core.geometry_utils import GeometryUtils, FaceProperties, EdgeProperties, VertexProperties
 
@@ -40,6 +40,50 @@ from visualization.motor_renderer import MotorRenderer
 
 # Import export module
 from export.exporter import AssemblyExporter
+
+
+class StepLoadWorker(QThread):
+    """Background worker for loading STEP files and running physics calculations.
+    This keeps the UI responsive during potentially slow operations.
+    """
+    progress = Signal(str)           # status message
+    result = Signal(list, float)     # bodies, unit_scale
+    error = Signal(str)
+
+    def __init__(self, filepath: str):
+        super().__init__()
+        self.filepath = filepath
+
+    def run(self):
+        try:
+            self.progress.emit("Reading STEP file...")
+            shape, unit_scale = StepParser.load_step_file(self.filepath)
+
+            if shape is None:
+                self.error.emit("Could not load STEP file (invalid or empty).")
+                return
+
+            self.progress.emit("Extracting individual bodies...")
+            bodies = StepParser.extract_bodies_from_compound(shape)
+
+            self.progress.emit("Calculating volumes...")
+            PhysicsCalculator.calculate_volumes_for_bodies(bodies, unit_scale)
+
+            self.progress.emit("Calculating centers of mass...")
+            PhysicsCalculator.calculate_centers_of_mass_for_bodies(bodies, unit_scale)
+
+            self.progress.emit("Calculating inertia tensors...")
+            PhysicsCalculator.calculate_inertia_tensors_for_bodies(bodies, unit_scale)
+
+            self.progress.emit("Initializing local frames...")
+            PhysicsCalculator.initialize_local_frames(bodies)
+
+            self.result.emit(bodies, unit_scale)
+
+        except Exception as e:
+            import traceback
+            traceback.print_exc()
+            self.error.emit(f"Error loading file: {str(e)}")
 
 
 class MainWindow(QMainWindow):
@@ -87,6 +131,20 @@ class MainWindow(QMainWindow):
         
         # Initialize body storage
         self.bodies: List[RigidBody] = []
+
+        # Mutable State holding current positions/orientations for the assembly and all bodies.
+        # Populated after loading a STEP file. Bodies reference it via body.state.
+        self.assembly_state: Optional[State] = None
+
+        # --- Drag update throttling for smoothness ---
+        # MouseMove can fire at very high rates. We use a timer to apply visual
+        # updates at a fixed rate (e.g. 60 FPS) for much higher perceived smoothness.
+        self._drag_update_timer = QTimer(self)
+        self._drag_update_timer.setInterval(16)  # ~60 FPS target
+        self._drag_update_timer.timeout.connect(self._apply_pending_drag_update)
+        self._pending_drag_body_id: Optional[int] = None
+        self._pending_drag_pos: Optional[np.ndarray] = None
+        self._dragging_body_ref: Optional[RigidBody] = None  # cache for speed
         
         # Initialize renderers
         self.body_renderer = BodyRenderer(self.display)
@@ -120,6 +178,11 @@ class MainWindow(QMainWindow):
         
         # Connect viewer click selection
         self.viewer_3d.on_body_clicked = self.on_body_clicked_in_viewer
+
+        # Connect body dragging (translates via State + renderer)
+        self.viewer_3d.on_body_drag_start = self.on_body_drag_start
+        self.viewer_3d.on_body_drag_move = self.on_body_drag_move
+        self.viewer_3d.on_body_drag_end = self.on_body_drag_end
         
         # Connect property panel signals
         self.property_panel.com_visibility_changed.connect(self.on_com_visibility_changed)
@@ -297,159 +360,186 @@ class MainWindow(QMainWindow):
             self.load_step_file(filepath)
 
     def load_step_file(self, filepath):
-        """Load and display a STEP file"""
-        try:
-            print(f"Loading STEP file: {filepath}")
-            
-            # Store the current STEP file path
-            self.current_step_file = filepath
+        """Load and display a STEP file (heavy work runs in background thread)."""
+        print(f"Loading STEP file: {filepath}")
+        
+        # Store the current STEP file path
+        self.current_step_file = filepath
 
-            # Clear previous display and bodies
-            self.body_renderer.clear_all()
-            self.face_renderer.clear_highlight()
-            self.edge_renderer.clear_highlight()
-            self.vertex_renderer.clear_highlight()
-            self.viewer_3d.clear_mappings()
-            self.bodies.clear()
-            self.body_tree.clear()
-            self.property_panel.clear()
-            self.frame_renderer.clear_all_frames()
-            self.created_frames.clear()
-            self.frame_to_body_map.clear()  # Clear frame-to-body associations
-            self.joints.clear()
-            self.joint_renderer.clear()
-            self.forces.clear()
-            self.force_renderer.clear_all()
-            self.torques.clear()
-            self.torque_renderer.clear_all_torques()
-            self.last_face_selection = None
-            self.last_edge_selection = None
-            self.last_vertex_selection = None
-            
-            # Reset selection mode to Body (default)
-            self.property_panel.set_selection_mode("Body")
+        # Clear previous display and bodies (must be done on main thread)
+        self._clear_ui_for_new_load()
 
-            # Read the STEP file using StepParser
-            shape, unit_scale = StepParser.load_step_file(filepath)
-            self.unit_scale = unit_scale
+        # Reset selection mode
+        self.property_panel.set_selection_mode("Body")
 
-            # Update renderers with the new unit scale
-            self.frame_renderer.set_unit_scale(unit_scale)
-            self.body_renderer.set_unit_scale(unit_scale)
-            self.force_renderer.set_unit_scale(unit_scale)
-            self.torque_renderer.set_unit_scale(unit_scale)
-            self.vertex_renderer.set_unit_scale(unit_scale)
+        # Disable interaction while loading
+        self.setEnabled(False)
+        if hasattr(self, 'statusBar'):
+            self.statusBar().showMessage("Loading STEP file...")
 
-            if shape is None:
-                QMessageBox.warning(
-                    self,
-                    "Error",
-                    "Could not load STEP file. Please check the file format."
+        # If a previous load is running, stop it
+        if hasattr(self, 'load_worker') and self.load_worker and self.load_worker.isRunning():
+            self.load_worker.quit()
+            self.load_worker.wait()
+
+        # Start background worker
+        self.load_worker = StepLoadWorker(filepath)
+        self.load_worker.progress.connect(self.on_load_progress)
+        self.load_worker.result.connect(self.on_load_result)
+        self.load_worker.error.connect(self.on_load_error)
+        self.load_worker.finished.connect(self._on_load_worker_finished)
+        self.load_worker.start()
+
+    def _clear_ui_for_new_load(self):
+        """Clear all previous data (called on main thread before starting load)."""
+        self.body_renderer.clear_all()
+        self.face_renderer.clear_highlight()
+        self.edge_renderer.clear_highlight()
+        self.vertex_renderer.clear_highlight()
+        self.viewer_3d.clear_mappings()
+        self.bodies.clear()
+        self.body_tree.clear()
+        self.property_panel.clear()
+        self.frame_renderer.clear_all_frames()
+        self.created_frames.clear()
+        self.frame_to_body_map.clear()
+        self.joints.clear()
+        self.joint_renderer.clear()
+        self.forces.clear()
+        self.force_renderer.clear_all()
+        self.torques.clear()
+        self.torque_renderer.clear_all_torques()
+        self.last_face_selection = None
+        self.last_edge_selection = None
+        self.last_vertex_selection = None
+
+        self.assembly_state = None
+
+        # Cancel drag state
+        if hasattr(self, 'viewer_3d') and self.viewer_3d:
+            self.viewer_3d._dragging_body_id = None
+            self.viewer_3d._drag_start_screen = None
+            self.viewer_3d._drag_start_world_pos = None
+            self.viewer_3d._last_drag_screen = None
+
+        if hasattr(self, '_drag_update_timer'):
+            self._drag_update_timer.stop()
+        self._pending_drag_body_id = None
+        self._pending_drag_pos = None
+        self._dragging_body_ref = None
+
+    def on_load_progress(self, message: str):
+        print(message)
+        if hasattr(self, 'statusBar'):
+            self.statusBar().showMessage(message)
+
+    def on_load_result(self, bodies: list, unit_scale: float):
+        """Called on main thread when background loading succeeds."""
+        print(f"Load complete. Received {len(bodies)} bodies.")
+        self.unit_scale = unit_scale
+
+        # Update renderers
+        self.frame_renderer.set_unit_scale(unit_scale)
+        self.body_renderer.set_unit_scale(unit_scale)
+        self.force_renderer.set_unit_scale(unit_scale)
+        self.torque_renderer.set_unit_scale(unit_scale)
+        self.vertex_renderer.set_unit_scale(unit_scale)
+
+        self.bodies = bodies
+
+        print(f"Found {len(self.bodies)} body/bodies in the assembly:")
+        for body in self.bodies:
+            print(f"  - {body.name} (ID: {body.id})")
+
+        # Create and attach the mutable State
+        self.assembly_state = State()
+        for body in self.bodies:
+            if body.local_frame is not None:
+                self.assembly_state.set_body_pose(
+                    body.id,
+                    body.local_frame.origin.copy(),
+                    body.local_frame.rotation_matrix.copy()
                 )
-                print("Error: Could not load STEP file")
-                return
+            body.state = self.assembly_state
+        print(f"State initialized for {len(self.bodies)} bodies.")
 
-            # Extract individual bodies from the shape
-            self.bodies = StepParser.extract_bodies_from_compound(shape)
+        # Update UI
+        self.body_tree.update_bodies(self.bodies)
+        self.body_renderer.display_bodies(self.bodies)
 
-            print(f"Found {len(self.bodies)} body/bodies in the assembly:")
-            for body in self.bodies:
-                print(f"  - {body.name} (ID: {body.id})")
+        # Continue with face/edge/vertex extraction and rest of setup
+        self._finish_step_load(unit_scale)
 
-            # Calculate volumes for all bodies
-            print("\nCalculating volumes...")
-            PhysicsCalculator.calculate_volumes_for_bodies(self.bodies, unit_scale)
-            print("Volume calculation complete.\n")
+    def on_load_error(self, message: str):
+        QMessageBox.critical(self, "Load Error", message)
+        print("Load error:", message)
+        self.setEnabled(True)
+        if hasattr(self, 'statusBar'):
+            self.statusBar().showMessage("Load failed")
 
-            # Calculate centers of mass for all bodies
-            PhysicsCalculator.calculate_centers_of_mass_for_bodies(self.bodies, unit_scale)
+    def _on_load_worker_finished(self):
+        """Cleanup after worker thread ends."""
+        self.setEnabled(True)
+        if hasattr(self, 'statusBar'):
+            self.statusBar().showMessage("Ready")
 
-            # Calculate inertia tensors for all bodies
-            PhysicsCalculator.calculate_inertia_tensors_for_bodies(self.bodies, unit_scale)
+    def _finish_step_load(self, unit_scale: float):
+        """Second part of STEP loading that must happen on main thread after bodies exist."""
+        # Extract face and edge properties for all bodies
+        print("\nExtracting face, edge, and vertex properties...")
+        self.face_properties_map.clear()
+        self.edge_properties_map.clear()
+        self.vertex_properties_map.clear()
+        bodies_dict = {}
 
-            # Initialize local frames for all bodies
-            PhysicsCalculator.initialize_local_frames(self.bodies)
+        for body in self.bodies:
+            self.face_properties_map[body.id] = GeometryUtils.extract_faces(body.shape, unit_scale)
+            self.edge_properties_map[body.id] = GeometryUtils.extract_edges(body.shape, unit_scale)
+            self.vertex_properties_map[body.id] = GeometryUtils.extract_vertices(body.shape, unit_scale)
+            bodies_dict[body.id] = body
+            print(f"Body {body.id}: {len(self.face_properties_map[body.id])} faces, "
+                  f"{len(self.edge_properties_map[body.id])} edges, "
+                  f"{len(self.vertex_properties_map[body.id])} vertices")
 
-            # Update the body tree widget
-            self.body_tree.update_bodies(self.bodies)
+        self.viewer_3d.set_body_mapping(self.body_renderer.body_ais_shapes, bodies_dict)
 
-            # Display all bodies in the viewer using the renderer
-            self.body_renderer.display_bodies(self.bodies)
+        self.display.FitAll()
 
-            # Extract face and edge properties for all bodies
-            print("\nExtracting face, edge, and vertex properties...")
-            self.face_properties_map.clear()
-            self.edge_properties_map.clear()
-            self.vertex_properties_map.clear()
-            bodies_dict = {}  # body_id -> RigidBody
+        # Scale world frame axes etc. (same as before)
+        from OCC.Core.Bnd import Bnd_Box
+        from OCC.Core.BRepBndLib import brepbndlib
 
-            for body in self.bodies:
-                self.face_properties_map[body.id] = GeometryUtils.extract_faces(body.shape, self.unit_scale)
-                self.edge_properties_map[body.id] = GeometryUtils.extract_edges(body.shape, self.unit_scale)
-                self.vertex_properties_map[body.id] = GeometryUtils.extract_vertices(body.shape, self.unit_scale)
-                bodies_dict[body.id] = body
-                print(f"Body {body.id}: {len(self.face_properties_map[body.id])} faces, "
-                      f"{len(self.edge_properties_map[body.id])} edges, "
-                      f"{len(self.vertex_properties_map[body.id])} vertices")
+        bbox = Bnd_Box()
+        for body in self.bodies:
+            brepbndlib.Add(body.shape, bbox)
 
-            # Update viewer's body-to-AIS mapping for click selection (with bodies_dict for face/edge selection)
-            self.viewer_3d.set_body_mapping(self.body_renderer.body_ais_shapes, bodies_dict)
+        if not bbox.IsVoid():
+            xmin, ymin, zmin, xmax, ymax, zmax = bbox.Get()
+            x_range = xmax - xmin
+            y_range = ymax - ymin
+            z_range = zmax - zmin
+            max_dimension = max(x_range, y_range, z_range)
 
-            # Fit view
-            self.display.FitAll()
+            axis_scale = max_dimension * 0.2
+            self.frame_renderer.set_axis_scale(axis_scale)
             
-            # Scale world frame axes based on bounding box
-            # Get bounding box dimensions by computing from displayed shapes
-            from OCC.Core.Bnd import Bnd_Box
-            from OCC.Core.BRepBndLib import brepbndlib
+            force_scale = max_dimension * 0.3
+            self.force_renderer.set_force_scale(force_scale)
+            
+            torque_scale = max_dimension * 0.2
+            self.torque_renderer.set_torque_scale(torque_scale)
 
-            bbox = Bnd_Box()
-            for body in self.bodies:
-                brepbndlib.Add(body.shape, bbox)
+            current_visibility = self.frame_renderer.frame_visible.get("World Frame", True)
+            self.frame_renderer.render_frame(self.world_frame, visible=current_visibility)
 
-            if not bbox.IsVoid():
-                xmin, ymin, zmin, xmax, ymax, zmax = bbox.Get()
-                x_range = xmax - xmin
-                y_range = ymax - ymin
-                z_range = zmax - zmin
-                max_dimension = max(x_range, y_range, z_range)
+            print(f"Frame axes scaled to {axis_scale:.4f}")
+            print(f"Force arrows scaled to {force_scale:.4f}") 
+            print(f"Torque circles scaled to {torque_scale:.4f}")
 
-                # Scale axes to 20% of model size
-                axis_scale = max_dimension * 0.2
-                self.frame_renderer.set_axis_scale(axis_scale)
-                
-                # Scale forces to 30% of model size (increased for visibility)
-                force_scale = max_dimension * 0.3
-                self.force_renderer.set_force_scale(force_scale)
-                
-                # Scale torques to 20% of model size
-                torque_scale = max_dimension * 0.2
-                self.torque_renderer.set_torque_scale(torque_scale)
-
-                # Re-render world frame with new scale
-                current_visibility = self.frame_renderer.frame_visible.get("World Frame", True)
-                self.frame_renderer.render_frame(self.world_frame, visible=current_visibility)
-
-                print(f"Frame axes scaled to {axis_scale:.4f}")
-                print(f"Force arrows scaled to {force_scale:.4f}") 
-                print(f"Torque circles scaled to {torque_scale:.4f}")
-
-            print(f"STEP file loaded successfully! Total bodies: {len(self.bodies)}")
-
-        except FileNotFoundError as e:
-            QMessageBox.critical(
-                self,
-                "File Not Found",
-                str(e)
-            )
-            print(f"File not found: {e}")
-        except Exception as e:
-            QMessageBox.critical(
-                self,
-                "Error",
-                f"Error loading STEP file:\n{str(e)}"
-            )
-            print(f"Error loading STEP file: {e}")
+        print(f"STEP file loaded successfully! Total bodies: {len(self.bodies)}")
+        self.setEnabled(True)
+        if hasattr(self, 'statusBar'):
+            self.statusBar().showMessage("Ready")
 
     def on_body_clicked_in_viewer(self, body_id: int):
         """
@@ -462,6 +552,100 @@ class MainWindow(QMainWindow):
         self.body_tree.select_body(body_id)
         # Tree selection will trigger on_body_selected automatically
 
+    # ------------------------------------------------------------------
+    # Mouse drag support (updates State and re-renders the body)
+    # ------------------------------------------------------------------
+
+    def on_body_drag_start(self, body_id: int):
+        """Called when the user starts dragging a body in the viewer."""
+        print(f"Drag started on body {body_id}")
+        # Make sure the property panel shows the body
+        self.on_body_selected(body_id)
+
+        # Cache for performance and start throttled update timer
+        self._dragging_body_ref = next((b for b in self.bodies if b.id == body_id), None)
+        self._pending_drag_body_id = body_id
+        self._pending_drag_pos = None
+        self._drag_update_timer.start()
+
+    def on_body_drag_move(self, body_id: int, new_world_pos: np.ndarray):
+        """Very lightweight: just record the latest desired position.
+        The actual State + visual update happens in the timer at fixed rate.
+        This decouples high-frequency mouse events from rendering.
+        """
+        self._pending_drag_pos = new_world_pos
+        # We keep _pending_drag_body_id set from start
+        # No heavy work here → much higher effective FPS
+
+    def on_body_drag_end(self, body_id: int):
+        """Called when the user releases the mouse after dragging.
+        Refresh expensive visuals (local frame, COM marker) once at the end.
+        """
+        print(f"Drag ended on body {body_id}")
+
+        # Stop the throttled update timer
+        self._drag_update_timer.stop()
+        self._pending_drag_body_id = None
+        self._pending_drag_pos = None
+        self._dragging_body_ref = None
+
+        body = next((b for b in self.bodies if b.id == body_id), None)
+        if not body:
+            return
+
+        # Refresh local frame once (if it was the selected body and visible)
+        if self.selected_body_id == body_id and body.local_frame is not None:
+            try:
+                visible = self.property_panel.local_frame_checkbox.isChecked()
+            except Exception:
+                visible = True
+            self.frame_renderer.render_frame(body.local_frame, visible=visible)
+
+        # Refresh COM marker once
+        if (self.body_renderer.currently_highlighted_id == body_id and
+                self.body_renderer.com_marker_visible):
+            self.body_renderer._update_com_marker(body_id)
+
+        self.display.Repaint()
+
+    def _apply_pending_drag_update(self):
+        """Called by timer at fixed rate (e.g. 60 FPS).
+        Applies the latest pending pose if any. This gives smooth, consistent updates
+        even if mouse events come faster or slower.
+        """
+        if self._pending_drag_body_id is None or self._pending_drag_pos is None:
+            return
+
+        body_id = self._pending_drag_body_id
+        new_pos = self._pending_drag_pos
+
+        # Use cached body ref for speed
+        body = self._dragging_body_ref
+        if body is None or body.state is None:
+            return
+
+        try:
+            current_rot = body.get_world_rotation_matrix()
+            self.assembly_state.set_body_pose(body_id, new_pos, current_rot)
+
+            # Only the body visual transform here (light)
+            self.body_renderer.update_body_transform(body_id)
+
+            # Keep local_frame data in sync (no render)
+            if self.selected_body_id == body_id and body.local_frame is not None:
+                body.local_frame.origin = new_pos.copy()
+                body.local_frame.rotation_matrix = current_rot.copy()
+
+            # Push the change and repaint at controlled rate.
+            # Redisplay was called with False in the renderer.
+            self.body_renderer.display.Context.UpdateCurrentViewer()
+            self.display.Repaint()
+
+            # Consume the pending so we don't re-apply the same pose
+            self._pending_drag_pos = None
+        except Exception as e:
+            print(f"Error in throttled drag update for {body_id}: {e}")
+
     def on_body_selected(self, body_id: int):
         """
         Handle body selection from the tree widget
@@ -472,8 +656,9 @@ class MainWindow(QMainWindow):
         print(f"Highlighting body {body_id} in viewer")
         self.body_renderer.highlight_body(body_id)
 
-        # Ensure the property panel is showing the body section
+        # Ensure the property panel and viewer are in Body selection mode (important for dragging)
         self.property_panel.set_selection_mode("Body")
+        self.viewer_3d.set_selection_mode("Body")
         
         # Hide previous body's local frame if any
         if self.selected_body_id is not None:
@@ -858,6 +1043,10 @@ class MainWindow(QMainWindow):
         # Remove from bodies list
         self.bodies = [b for b in self.bodies if b.id != body_id]
         
+        # Prune pose from the mutable State (if present)
+        if self.assembly_state is not None:
+            self.assembly_state.remove_body_pose(body_id)
+        
         # Clear selection if this was the selected body
         if self.selected_body_id == body_id:
             self.selected_body_id = None
@@ -965,6 +1154,11 @@ class MainWindow(QMainWindow):
         
         # Remove all deleted bodies from the bodies list
         self.bodies = [b for b in self.bodies if b.id not in body_ids]
+        
+        # Prune poses from the mutable State
+        if self.assembly_state is not None:
+            for bid in body_ids:
+                self.assembly_state.remove_body_pose(bid)
         
         # Clear selection if any deleted body was selected
         if self.selected_body_id in body_ids:
