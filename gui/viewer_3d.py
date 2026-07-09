@@ -133,11 +133,12 @@ class SelectableViewer3d(qtViewer3d):
 
     def mousePressEvent(self, event):
         """
-        Body dragging requires Ctrl + Left click (to keep normal left/right/middle free for camera controls).
+        Left mouse is dedicated to body selection and direct mouse dragging (interactive via mouse, no gizmo).
+        Right/Middle for camera (rotate/pan).
         """
         from PySide6.QtCore import Qt
 
-        if event.button() == Qt.LeftButton and (event.modifiers() & Qt.ControlModifier):
+        if event.button() == Qt.LeftButton:
             if self.selection_mode != "Body":
                 self.set_selection_mode("Body")
 
@@ -147,29 +148,30 @@ class SelectableViewer3d(qtViewer3d):
                 self._start_body_drag(body_id, pt.x(), pt.y())
                 if self.on_body_clicked:
                     self.on_body_clicked(body_id)
+            # Consume left for body interaction / selection
             return
 
+        # Right or Middle: let parent handle camera
         super().mousePressEvent(event)
 
     def mouseMoveEvent(self, event):
         """
-        Only intercept mouse moves when we are actively dragging a body (started with Ctrl+Left).
-        Otherwise let the base viewer handle camera controls (right/middle, and possibly left).
+        Intercept only while actively body-dragging with left.
+        Otherwise let base handle (camera on right/middle).
         """
         from PySide6.QtCore import Qt
 
         if self._dragging_body_id is not None and (event.buttons() & Qt.LeftButton):
             pt = event.pos()
             self._update_body_drag(pt.x(), pt.y())
-            return  # consume only while body dragging
+            return
 
-        # All other cases (plain left, right, middle) go to base for camera / default
         super().mouseMoveEvent(event)
 
     def mouseReleaseEvent(self, event):
         """
-        Left release: end drag or do body selection.
-        Right/Middle release: parent handles camera.
+        Left release for drag end or selection.
+        Right/Middle for camera.
         """
         from PySide6.QtCore import Qt
 
@@ -179,16 +181,13 @@ class SelectableViewer3d(qtViewer3d):
         if event.button() == Qt.LeftButton:
             if self._dragging_body_id is not None:
                 self._end_body_drag()
-                # Consumed
                 return
 
-            # Normal left-click selection on release (if not area select)
             if not self._select_area and modifiers == Qt.NoModifier:
                 self._select_at_position(pt.x(), pt.y())
-            # Always consume left release
+
             return
 
-        # Right or Middle release → parent camera handling
         super().mouseReleaseEvent(event)
 
     def _select_at_position(self, x: int, y: int):
@@ -688,7 +687,8 @@ class SelectableViewer3d(qtViewer3d):
 
             # Optional sensitivity tweak: for many assemblies this feels good.
             # Increase if drag feels too slow, decrease if too fast.
-            world_per_pixel *= 1.0
+            # Tweak this value if movement feels "clunky" or too sensitive.
+            world_per_pixel *= 0.8
 
             dx = float(curr_x - start_x) * world_per_pixel
             dy = float(curr_y - start_y) * world_per_pixel

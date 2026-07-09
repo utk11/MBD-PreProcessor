@@ -12,6 +12,8 @@ import numpy as np
 from OCC.Display.backend import load_backend
 load_backend('pyside6')
 
+
+
 # Import core modules
 from core.step_parser import StepParser
 from core.data_structures import RigidBody, Frame, Joint, JointType, Force, Torque, MotorType, State, Pose
@@ -145,6 +147,7 @@ class MainWindow(QMainWindow):
         self._pending_drag_body_id: Optional[int] = None
         self._pending_drag_pos: Optional[np.ndarray] = None
         self._dragging_body_ref: Optional[RigidBody] = None  # cache for speed
+        self._last_applied_drag_pos: Optional[np.ndarray] = None  # for drag smoothness epsilon check
         
         # Initialize renderers
         self.body_renderer = BodyRenderer(self.display)
@@ -428,6 +431,8 @@ class MainWindow(QMainWindow):
         self._pending_drag_pos = None
         self._dragging_body_ref = None
 
+
+
     def on_load_progress(self, message: str):
         print(message)
         if hasattr(self, 'statusBar'):
@@ -566,6 +571,7 @@ class MainWindow(QMainWindow):
         self._dragging_body_ref = next((b for b in self.bodies if b.id == body_id), None)
         self._pending_drag_body_id = body_id
         self._pending_drag_pos = None
+        self._last_applied_drag_pos = None
         self._drag_update_timer.start()
 
     def on_body_drag_move(self, body_id: int, new_world_pos: np.ndarray):
@@ -588,6 +594,7 @@ class MainWindow(QMainWindow):
         self._pending_drag_body_id = None
         self._pending_drag_pos = None
         self._dragging_body_ref = None
+        self._last_applied_drag_pos = None
 
         body = next((b for b in self.bodies if b.id == body_id), None)
         if not body:
@@ -625,6 +632,13 @@ class MainWindow(QMainWindow):
             return
 
         try:
+            # Skip tiny changes for smoothness (avoid unnecessary Redisplay/Repaint)
+            if self._last_applied_drag_pos is not None:
+                diff = np.linalg.norm(new_pos - self._last_applied_drag_pos)
+                if diff < 1e-5:  # ~0.01mm threshold
+                    self._pending_drag_pos = None
+                    return
+
             current_rot = body.get_world_rotation_matrix()
             self.assembly_state.set_body_pose(body_id, new_pos, current_rot)
 
@@ -641,6 +655,7 @@ class MainWindow(QMainWindow):
             self.body_renderer.display.Context.UpdateCurrentViewer()
             self.display.Repaint()
 
+            self._last_applied_drag_pos = new_pos.copy()
             # Consume the pending so we don't re-apply the same pose
             self._pending_drag_pos = None
         except Exception as e:
