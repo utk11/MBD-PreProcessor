@@ -68,6 +68,10 @@ class SelectableViewer3d(qtViewer3d):
         self._drag_start_screen: Optional[Tuple[int, int]] = None
         self._drag_start_world_pos: Optional[np.ndarray] = None
 
+        # For explicit camera control (right=rotate, middle=pan) to prevent left from rotating view
+        self._prev_mouse_x: int = 0
+        self._prev_mouse_y: int = 0
+
         # Callbacks provided by MainWindow for drag interaction
         self.on_body_drag_start: Optional[Callable[[int], None]] = None
         self.on_body_drag_move: Optional[Callable[[int, np.ndarray], None]] = None  # body_id, new_world_pos (meters)
@@ -133,37 +137,77 @@ class SelectableViewer3d(qtViewer3d):
 
     def mousePressEvent(self, event):
         """
-        Left mouse is dedicated to body selection and direct mouse dragging (interactive via mouse, no gizmo).
+        Left mouse handling depends on selection mode:
+        - In "Body" mode: start body drag/selection (dedicated for interactive body manipulation).
+        - In "Face"/"Edge"/"Vertex" mode: let the event flow to release logic for sub-shape selection.
         Right/Middle for camera (rotate/pan).
         """
         from PySide6.QtCore import Qt
+        pt = event.pos()
+        dpr = float(self.devicePixelRatioF())
+        px = int(pt.x() * dpr)
+        py = int(pt.y() * dpr)
 
         if event.button() == Qt.LeftButton:
-            if self.selection_mode != "Body":
-                self.set_selection_mode("Body")
-
-            pt = event.pos()
-            body_id = self._get_body_id_at(pt.x(), pt.y())
-            if body_id is not None:
-                self._start_body_drag(body_id, pt.x(), pt.y())
-                if self.on_body_clicked:
-                    self.on_body_clicked(body_id)
-            # Consume left for body interaction / selection
+            if self.selection_mode == "Body":
+                body_id = self._get_body_id_at(pt.x(), pt.y())
+                if body_id is not None:
+                    self._start_body_drag(body_id, pt.x(), pt.y())
+                    if self.on_body_clicked:
+                        self.on_body_clicked(body_id)
+            # Always consume Left: body drag/selection or sub-shape selection.
+            # Never let left button trigger camera rotation/pan.
+            self._prev_mouse_x = px
+            self._prev_mouse_y = py
             return
 
-        # Right or Middle: let parent handle camera
+        elif event.button() == Qt.RightButton:
+            # Explicit: right button drag rotates the camera view
+            self._display.View.StartRotation(px, py)
+            self._prev_mouse_x = px
+            self._prev_mouse_y = py
+            return
+
+        elif event.button() == Qt.MiddleButton:
+            # Explicit: middle button drag pans the camera view
+            self._display.View.StartPan()
+            self._prev_mouse_x = px
+            self._prev_mouse_y = py
+            return
+
         super().mousePressEvent(event)
 
     def mouseMoveEvent(self, event):
         """
-        Intercept only while actively body-dragging with left.
-        Otherwise let base handle (camera on right/middle).
+        Body drag on left (only when flag set).
+        Explicit camera on right (rotate) / middle (pan).
         """
         from PySide6.QtCore import Qt
+        pt = event.pos()
+        dpr = float(self.devicePixelRatioF())
+        px = int(pt.x() * dpr)
+        py = int(pt.y() * dpr)
 
         if self._dragging_body_id is not None and (event.buttons() & Qt.LeftButton):
-            pt = event.pos()
             self._update_body_drag(pt.x(), pt.y())
+            self._prev_mouse_x = px
+            self._prev_mouse_y = py
+            return
+
+        elif event.buttons() & Qt.RightButton:
+            # Continue camera rotation
+            self._display.View.Rotation(px, py)
+            self._prev_mouse_x = px
+            self._prev_mouse_y = py
+            return
+
+        elif event.buttons() & Qt.MiddleButton:
+            # Continue camera pan with delta
+            dx = px - self._prev_mouse_x
+            dy = py - self._prev_mouse_y
+            self._display.View.Pan(dx, dy)
+            self._prev_mouse_x = px
+            self._prev_mouse_y = py
             return
 
         super().mouseMoveEvent(event)
@@ -171,7 +215,7 @@ class SelectableViewer3d(qtViewer3d):
     def mouseReleaseEvent(self, event):
         """
         Left release for drag end or selection.
-        Right/Middle for camera.
+        Right/Middle release ends camera action (base may handle too).
         """
         from PySide6.QtCore import Qt
 
@@ -183,11 +227,22 @@ class SelectableViewer3d(qtViewer3d):
                 self._end_body_drag()
                 return
 
-            if not self._select_area and modifiers == Qt.NoModifier:
+            if self.selection_mode == "Body":
+                if not self._select_area and modifiers == Qt.NoModifier:
+                    self._select_at_position(pt.x(), pt.y())
+            else:
+                # For Face/Edge/Vertex modes, always run our custom selection logic
+                # to make sure sub-shape selection works reliably.
                 self._select_at_position(pt.x(), pt.y())
 
+            self._prev_mouse_x = int(pt.x() * float(self.devicePixelRatioF()))
+            self._prev_mouse_y = int(pt.y() * float(self.devicePixelRatioF()))
             return
 
+        # For right/middle release, record pos (camera end handled by base or explicit)
+        dpr = float(self.devicePixelRatioF())
+        self._prev_mouse_x = int(pt.x() * dpr)
+        self._prev_mouse_y = int(pt.y() * dpr)
         super().mouseReleaseEvent(event)
 
     def _select_at_position(self, x: int, y: int):

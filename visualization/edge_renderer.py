@@ -6,6 +6,7 @@ from typing import Optional
 from OCC.Core.Quantity import Quantity_Color, Quantity_TOC_RGB
 from OCC.Core.AIS import AIS_Shape
 from OCC.Core.TopoDS import TopoDS_Edge
+from OCC.Core.gp import gp_Trsf
 from OCC.Display.OCCViewer import Viewer3d
 
 
@@ -25,12 +26,14 @@ class EdgeRenderer:
         self.display = display
         self.current_ais: Optional[AIS_Shape] = None
         
-    def highlight_edge(self, edge: TopoDS_Edge):
+    def highlight_edge(self, edge: TopoDS_Edge, trsf: Optional[gp_Trsf] = None):
         """
         Highlight a specific edge
         
         Args:
             edge: TopoDS_Edge to highlight
+            trsf: Optional local transformation to apply (e.g. body's current pose after drag)
+                  so the highlight moves with the transformed body.
         """
         self.clear_highlight()
         
@@ -44,6 +47,10 @@ class EdgeRenderer:
             # Set attributes
             self.display.Context.SetColor(self.current_ais, self.HIGHLIGHT_COLOR, False)
             self.display.Context.SetWidth(self.current_ais, 3.0, False)  # Thicker line
+            
+            # Apply transform if provided
+            if trsf:
+                self.current_ais.SetLocalTransformation(trsf)
             
             # Update viewer
             self.display.Context.UpdateCurrentViewer()

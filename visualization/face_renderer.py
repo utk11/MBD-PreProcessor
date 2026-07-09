@@ -6,6 +6,8 @@ from typing import Optional
 from OCC.Core.Quantity import Quantity_Color, Quantity_TOC_RGB
 from OCC.Core.AIS import AIS_Shape
 from OCC.Core.TopoDS import TopoDS_Face
+from OCC.Core.gp import gp_Trsf
+from typing import Optional  # ensure if not already
 from OCC.Display.OCCViewer import Viewer3d
 
 
@@ -25,12 +27,14 @@ class FaceRenderer:
         self.display = display
         self.current_ais: Optional[AIS_Shape] = None
         
-    def highlight_face(self, face: TopoDS_Face):
+    def highlight_face(self, face: TopoDS_Face, trsf: Optional[gp_Trsf] = None):
         """
         Highlight a specific face
         
         Args:
             face: TopoDS_Face to highlight
+            trsf: Optional local transformation to apply (e.g. body's current pose after drag)
+                  so the highlight moves with the transformed body.
         """
         self.clear_highlight()
         
@@ -43,6 +47,10 @@ class FaceRenderer:
             
             # Set attributes
             self.display.Context.SetColor(self.current_ais, self.HIGHLIGHT_COLOR, False)
+            
+            # Apply transform if provided (so highlight follows dragged body pose)
+            if trsf:
+                self.current_ais.SetLocalTransformation(trsf)
             
             # Optional: Set transparency to allow seeing texture/geometry behind if needed
             # self.display.Context.SetTransparency(self.current_ais, 0.2, False)

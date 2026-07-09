@@ -37,12 +37,14 @@ class VertexRenderer:
         # Set highlight size to roughly 5mm (0.005m) converted to model units
         self.highlight_size = 0.001 / scale
         
-    def highlight_vertex(self, vertex: TopoDS_Vertex):
+    def highlight_vertex(self, vertex: TopoDS_Vertex, trsf: Optional[gp_Trsf] = None):
         """
         Highlight a specific vertex by rendering a small sphere at its location
         
         Args:
             vertex: TopoDS_Vertex to highlight
+            trsf: Optional local transformation to apply (e.g. body's current pose after drag)
+                  so the highlight moves with the transformed body.
         """
         self.clear_highlight()
         
@@ -62,6 +64,10 @@ class VertexRenderer:
             
             # Set color
             self.display.Context.SetColor(self.current_ais, self.HIGHLIGHT_COLOR, False)
+            
+            # Apply transform if provided
+            if trsf:
+                self.current_ais.SetLocalTransformation(trsf)
             
             # Update viewer
             self.display.Context.UpdateCurrentViewer()

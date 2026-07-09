@@ -266,7 +266,8 @@ class MainWindow(QMainWindow):
 
         print("Application initialized successfully!")
         print("Viewer ready. Use File > Open to load a STEP file.")
-        print("Mouse controls: Right-click drag to rotate, Shift+Right-click to pan, Wheel to zoom.")
+        print("Mouse controls: Left-click/drag on body to select & move (in Body mode); Right-drag to rotate view; Middle-drag to pan; Wheel to zoom.")
+        print("View menu: snap to Top/Bottom/Front/Back/Left/Right or Isometric views.")
     
     def create_menu_bar(self):
         """Create the menu bar with File menu"""
@@ -328,6 +329,44 @@ class MainWindow(QMainWindow):
         add_torque_action = QAction("Add Torque...", self)
         add_torque_action.triggered.connect(self.add_torque)
         assembly_menu.addAction(add_torque_action)
+
+        # View menu
+        view_menu = menubar.addMenu("View")
+        
+        # Use full QAction for clarity and future shortcuts
+        top_act = QAction("Top (+Z)", self)
+        top_act.triggered.connect(self.set_view_top)
+        view_menu.addAction(top_act)
+
+        bot_act = QAction("Bottom (-Z)", self)
+        bot_act.triggered.connect(self.set_view_bottom)
+        view_menu.addAction(bot_act)
+
+        view_menu.addSeparator()
+
+        front_act = QAction("Front (+Y)", self)
+        front_act.triggered.connect(self.set_view_front)
+        view_menu.addAction(front_act)
+
+        back_act = QAction("Back (-Y)", self)
+        back_act.triggered.connect(self.set_view_back)
+        view_menu.addAction(back_act)
+
+        view_menu.addSeparator()
+
+        right_act = QAction("Right (+X)", self)
+        right_act.triggered.connect(self.set_view_right)
+        view_menu.addAction(right_act)
+
+        left_act = QAction("Left (-X)", self)
+        left_act.triggered.connect(self.set_view_left)
+        view_menu.addAction(left_act)
+
+        view_menu.addSeparator()
+
+        iso_act = QAction("Isometric", self)
+        iso_act.triggered.connect(self.set_view_isometric)
+        view_menu.addAction(iso_act)
 
         # Export menu
         export_menu = menubar.addMenu("Export")
@@ -645,6 +684,9 @@ class MainWindow(QMainWindow):
             # Only the body visual transform here (light)
             self.body_renderer.update_body_transform(body_id)
 
+            # Sync any active face/edge/vertex highlight for this body so it follows the drag
+            self._sync_highlight_transforms(body_id)
+
             # Keep local_frame data in sync (no render)
             if self.selected_body_id == body_id and body.local_frame is not None:
                 body.local_frame.origin = new_pos.copy()
@@ -660,6 +702,74 @@ class MainWindow(QMainWindow):
             self._pending_drag_pos = None
         except Exception as e:
             print(f"Error in throttled drag update for {body_id}: {e}")
+
+    def _sync_highlight_transforms(self, body_id: int):
+        """Apply the body's current local transform to any active sub-shape highlight
+        for that body (so face/edge/vertex highlights move with dragged body).
+        """
+        try:
+            ais = self.body_renderer.body_ais_shapes.get(body_id)
+            if not ais:
+                return
+            trsf = ais.LocalTransformation()
+
+            if self.last_face_selection and self.last_face_selection[0] == body_id:
+                if self.face_renderer.current_ais:
+                    self.face_renderer.current_ais.SetLocalTransformation(trsf)
+                    self.display.Context.Redisplay(self.face_renderer.current_ais, False)
+
+            if self.last_edge_selection and self.last_edge_selection[0] == body_id:
+                if self.edge_renderer.current_ais:
+                    self.edge_renderer.current_ais.SetLocalTransformation(trsf)
+                    self.display.Context.Redisplay(self.edge_renderer.current_ais, False)
+
+            if self.last_vertex_selection and self.last_vertex_selection[0] == body_id:
+                if self.vertex_renderer.current_ais:
+                    self.vertex_renderer.current_ais.SetLocalTransformation(trsf)
+                    self.display.Context.Redisplay(self.vertex_renderer.current_ais, False)
+        except Exception as e:
+            # non-fatal
+            pass
+
+    # ------------------------------------------------------------------
+    # Standard view snapping (perpendicular to axes + isometric)
+    # ------------------------------------------------------------------
+
+    def _set_view(self, px: float, py: float, pz: float, ux: float = 0.0, uy: float = 0.0, uz: float = 1.0):
+        """Helper to set camera projection and up vector, then fit."""
+        v = self.display.View
+        v.SetProj(px, py, pz)
+        v.SetUp(ux, uy, uz)
+        v.FitAll()
+        self.display.Context.UpdateCurrentViewer()
+
+    def set_view_top(self):
+        """Snap to top view (looking along +Z, Y up)."""
+        self._set_view(0.0, 0.0, 1.0, 0.0, 1.0, 0.0)
+
+    def set_view_bottom(self):
+        """Snap to bottom view (looking along -Z, Y up)."""
+        self._set_view(0.0, 0.0, -1.0, 0.0, 1.0, 0.0)
+
+    def set_view_front(self):
+        """Snap to front view (looking along +Y, Z up)."""
+        self._set_view(0.0, 1.0, 0.0, 0.0, 0.0, 1.0)
+
+    def set_view_back(self):
+        """Snap to back view (looking along -Y, Z up)."""
+        self._set_view(0.0, -1.0, 0.0, 0.0, 0.0, 1.0)
+
+    def set_view_right(self):
+        """Snap to right view (looking along +X, Z up)."""
+        self._set_view(1.0, 0.0, 0.0, 0.0, 0.0, 1.0)
+
+    def set_view_left(self):
+        """Snap to left view (looking along -X, Z up)."""
+        self._set_view(-1.0, 0.0, 0.0, 0.0, 0.0, 1.0)
+
+    def set_view_isometric(self):
+        """Snap to isometric view (approx. 1,1,1 direction, Z up)."""
+        self._set_view(1.0, 1.0, 1.0, 0.0, 0.0, 1.0)
 
     def on_body_selected(self, body_id: int):
         """
@@ -813,8 +923,15 @@ class MainWindow(QMainWindow):
             self.property_panel.show_face_properties(face_props)
             self.last_face_selection = (body_id, face_index)
             
-            # Highlight the face
-            self.face_renderer.highlight_face(face_props.face)
+            # Highlight the face, applying body's current pose transform so it follows drags
+            trsf = None
+            body_ais = self.body_renderer.body_ais_shapes.get(body_id)
+            if body_ais:
+                try:
+                    trsf = body_ais.LocalTransformation()
+                except:
+                    pass
+            self.face_renderer.highlight_face(face_props.face, trsf)
         else:
             print(f"Face properties not found for body {body_id}, face {face_index}")
             self.last_face_selection = None
@@ -837,8 +954,15 @@ class MainWindow(QMainWindow):
             self.property_panel.show_edge_properties(edge_props)
             self.last_edge_selection = (body_id, edge_index)
             
-            # Highlight the edge
-            self.edge_renderer.highlight_edge(edge_props.edge)
+            # Highlight the edge, applying body's current pose transform so it follows drags
+            trsf = None
+            body_ais = self.body_renderer.body_ais_shapes.get(body_id)
+            if body_ais:
+                try:
+                    trsf = body_ais.LocalTransformation()
+                except:
+                    pass
+            self.edge_renderer.highlight_edge(edge_props.edge, trsf)
         else:
             print(f"Edge properties not found for body {body_id}, edge {edge_index}")
             self.last_edge_selection = None
@@ -861,8 +985,15 @@ class MainWindow(QMainWindow):
             self.property_panel.show_vertex_properties(vertex_props)
             self.last_vertex_selection = (body_id, vertex_index)
             
-            # Highlight the vertex
-            self.vertex_renderer.highlight_vertex(vertex_props.vertex)
+            # Highlight the vertex, applying body's current pose transform so it follows drags
+            trsf = None
+            body_ais = self.body_renderer.body_ais_shapes.get(body_id)
+            if body_ais:
+                try:
+                    trsf = body_ais.LocalTransformation()
+                except:
+                    pass
+            self.vertex_renderer.highlight_vertex(vertex_props.vertex, trsf)
         else:
             print(f"Vertex properties not found for body {body_id}, vertex {vertex_index}")
             self.last_vertex_selection = None
