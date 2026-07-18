@@ -41,83 +41,55 @@ class FaceProperties:
     def _calculate_properties(self):
         """Calculate area, center, and normal for the face.
 
-        Center is the surface mass-centre projected back onto the face so the
-        point always lies on the visible geometry (planar faces → true center;
-        cylinders → on the wall, not the axis).
-        Coordinates from OCC are model units; ``center`` is stored in meters.
+        Center is the surface area centroid (CentreOfMass of the face). That
+        point is allowed to sit in empty space — e.g. on a cylinder/hole axis —
+        which is what joint frames need. It is NOT projected onto the skin.
+
+        OCC returns model units; ``center`` is stored in meters.
         ``center_model`` keeps the raw OCC coordinates for display alignment.
+
+        Normal is evaluated at the face UV midpoint (with orientation), since a
+        surface normal is only defined on the surface itself.
         """
         from OCC.Core.BRepLProp import BRepLProp_SLProps
         from OCC.Core.BRepAdaptor import BRepAdaptor_Surface
-        from OCC.Core.Extrema import Extrema_ExtPS
-        from OCC.Core.gp import gp_Pnt
 
         system = GProp_GProps()
         brepgprop.SurfaceProperties(self.face, system)
         self.area = system.Mass() * (self.unit_scale ** 2)
 
         self.center_model = np.array([0.0, 0.0, 0.0], dtype=float)
+        self.center = np.array([0.0, 0.0, 0.0], dtype=float)
         self.normal = np.array([0.0, 0.0, 1.0], dtype=float)
+
+        try:
+            mass_center = system.CentreOfMass()
+            self.center_model = np.array(
+                [mass_center.X(), mass_center.Y(), mass_center.Z()], dtype=float
+            )
+            self.center = self.center_model * float(self.unit_scale)
+        except Exception as e:
+            print(f"Warning: face center failed for face {self.face_index}: {e}")
+            self.center_model = np.zeros(3)
+            self.center = np.zeros(3)
 
         try:
             # Restriction=True → UV domain of the face; locations applied on Value()
             surface_adaptor = BRepAdaptor_Surface(self.face, True)
-
-            mass_center = system.CentreOfMass()
-            seed = gp_Pnt(mass_center.X(), mass_center.Y(), mass_center.Z())
-
-            # Project COM onto the surface so the origin is on the face
-            u_use = None
-            v_use = None
-            p_use = None
-            try:
-                ext = Extrema_ExtPS(seed, surface_adaptor, 1e-7, 1e-7)
-                if ext.IsDone() and ext.NbExt() > 0:
-                    best_i = 1
-                    best_d = ext.SquareDistance(1)
-                    for i in range(2, ext.NbExt() + 1):
-                        d = ext.SquareDistance(i)
-                        if d < best_d:
-                            best_d = d
-                            best_i = i
-                    p_use = ext.Point(best_i).Value()
-                    try:
-                        # Extrema_POnSurf.Parameter() → (u, v) in pythonocc
-                        uv = ext.Point(best_i).Parameter()
-                        if isinstance(uv, (tuple, list)) and len(uv) >= 2:
-                            u_use, v_use = float(uv[0]), float(uv[1])
-                        else:
-                            u_use = float(uv)
-                            v_use = float(ext.Point(best_i).Parameter(2)) if False else u_use
-                    except Exception:
-                        # Recover UV by re-projecting via adaptor bounds midpoint as last resort
-                        u_use = None
-                        v_use = None
-            except Exception as proj_err:
-                print(f"Face {self.face_index}: surface projection failed ({proj_err}); using UV mid")
-
-            if p_use is None or u_use is None or v_use is None:
-                u_min = surface_adaptor.FirstUParameter()
-                u_max = surface_adaptor.LastUParameter()
-                v_min = surface_adaptor.FirstVParameter()
-                v_max = surface_adaptor.LastVParameter()
-                if u_use is None:
-                    u_use = 0.5 * (u_min + u_max)
-                if v_use is None:
-                    v_use = 0.5 * (v_min + v_max)
-                if p_use is None:
-                    p_use = surface_adaptor.Value(u_use, v_use)
-
-            self.center_model = np.array(
-                [p_use.X(), p_use.Y(), p_use.Z()], dtype=float
+            u_mid = 0.5 * (
+                surface_adaptor.FirstUParameter() + surface_adaptor.LastUParameter()
             )
-            self.center = self.center_model * float(self.unit_scale)
+            v_mid = 0.5 * (
+                surface_adaptor.FirstVParameter() + surface_adaptor.LastVParameter()
+            )
 
             props = BRepLProp_SLProps(surface_adaptor, 1, 1e-7)
-            props.SetParameters(float(u_use), float(v_use))
+            props.SetParameters(float(u_mid), float(v_mid))
             if props.IsNormalDefined():
                 n_dir = props.Normal()
-                self.normal = np.array([n_dir.X(), n_dir.Y(), n_dir.Z()], dtype=float)
+                self.normal = np.array(
+                    [n_dir.X(), n_dir.Y(), n_dir.Z()], dtype=float
+                )
                 try:
                     from OCC.Core.TopAbs import TopAbs_REVERSED
                     if self.face.Orientation() == TopAbs_REVERSED:
@@ -130,16 +102,7 @@ class FaceProperties:
             else:
                 self.normal = np.array([0.0, 0.0, 1.0], dtype=float)
         except Exception as e:
-            print(f"Warning: face center/normal failed for face {self.face_index}: {e}")
-            try:
-                mass_center = system.CentreOfMass()
-                self.center_model = np.array(
-                    [mass_center.X(), mass_center.Y(), mass_center.Z()], dtype=float
-                )
-                self.center = self.center_model * float(self.unit_scale)
-            except Exception:
-                self.center_model = np.zeros(3)
-                self.center = np.zeros(3)
+            print(f"Warning: face normal failed for face {self.face_index}: {e}")
             self.normal = np.array([0.0, 0.0, 1.0], dtype=float)
     
     def __repr__(self):
@@ -212,52 +175,107 @@ class EdgeProperties:
     def _calculate_properties(self):
         """Calculate length, midpoint, and direction for the edge.
 
-        Uses BRepAdaptor_Curve.Value so the edge TopLoc_Location is applied
-        (reading the underlying Geom_Curve alone drops assembly placement).
+        Midpoint is the natural feature center and may sit in empty space:
+        - circle / ellipse → geometric center (hole/pin axis point in the edge plane)
+        - other curves → length-weighted centroid (LinearProperties COM)
+        - straight line → segment midpoint
+
+        It is NOT forced onto the curve (parametric mid sits on the metal and
+        looks offset for arcs and full circles).
+
+        Direction:
+        - circle / ellipse → plane normal (circle axis) — useful for revolute frames
+        - line → line direction
+        - else → chord or tangent fallback
+
+        BRepAdaptor_Curve applies the edge TopLoc_Location.
         """
         try:
             from OCC.Core.BRepAdaptor import BRepAdaptor_Curve
+            from OCC.Core.GeomAbs import (
+                GeomAbs_Circle,
+                GeomAbs_Ellipse,
+                GeomAbs_Line,
+            )
+            from OCC.Core.BRepLProp import BRepLProp_CLProps
 
             curve_adaptor = BRepAdaptor_Curve(self.edge)
             u_min = curve_adaptor.FirstParameter()
             u_max = curve_adaptor.LastParameter()
             u_mid = 0.5 * (u_min + u_max)
+            ctype = curve_adaptor.GetType()
 
-            # Value() returns points in world/model coords with location applied
-            start_pnt = curve_adaptor.Value(u_min)
-            end_pnt = curve_adaptor.Value(u_max)
-            mid_pnt = curve_adaptor.Value(u_mid)
+            # True curve length (not chord)
+            system = GProp_GProps()
+            brepgprop.LinearProperties(self.edge, system)
+            self.length = float(system.Mass()) * float(self.unit_scale)
 
-            start = np.array([start_pnt.X(), start_pnt.Y(), start_pnt.Z()], dtype=float)
-            end = np.array([end_pnt.X(), end_pnt.Y(), end_pnt.Z()], dtype=float)
-            mid = np.array([mid_pnt.X(), mid_pnt.Y(), mid_pnt.Z()], dtype=float)
+            mid = None
+            direction = None
 
-            self.length = float(np.linalg.norm(end - start)) * float(self.unit_scale)
-            self.midpoint_model = mid
-            self.midpoint = mid * float(self.unit_scale)
-
-            direction = end - start
-            length = float(np.linalg.norm(direction))
-            if length > 1e-10:
-                self.direction = direction / length
+            if ctype == GeomAbs_Circle:
+                circ = curve_adaptor.Circle()
+                loc = circ.Location()
+                mid = np.array([loc.X(), loc.Y(), loc.Z()], dtype=float)
+                ax = circ.Axis().Direction()
+                direction = np.array([ax.X(), ax.Y(), ax.Z()], dtype=float)
+            elif ctype == GeomAbs_Ellipse:
+                ell = curve_adaptor.Ellipse()
+                loc = ell.Location()
+                mid = np.array([loc.X(), loc.Y(), loc.Z()], dtype=float)
+                ax = ell.Axis().Direction()
+                direction = np.array([ax.X(), ax.Y(), ax.Z()], dtype=float)
             else:
-                # Degenerate edge — try curve tangent at mid
+                # Length centroid — on the segment for lines; may be off-curve
+                # for bent wires (allowed; same idea as face area COM).
+                mc = system.CentreOfMass()
+                mid = np.array([mc.X(), mc.Y(), mc.Z()], dtype=float)
+
+                if ctype == GeomAbs_Line:
+                    line = curve_adaptor.Line()
+                    d = line.Direction()
+                    direction = np.array([d.X(), d.Y(), d.Z()], dtype=float)
+                else:
+                    start_pnt = curve_adaptor.Value(u_min)
+                    end_pnt = curve_adaptor.Value(u_max)
+                    start = np.array(
+                        [start_pnt.X(), start_pnt.Y(), start_pnt.Z()], dtype=float
+                    )
+                    end = np.array(
+                        [end_pnt.X(), end_pnt.Y(), end_pnt.Z()], dtype=float
+                    )
+                    chord = end - start
+                    clen = float(np.linalg.norm(chord))
+                    if clen > 1e-10:
+                        direction = chord / clen
+
+            if direction is None or float(np.linalg.norm(direction)) < 1e-12:
                 try:
-                    from OCC.Core.BRepLProp import BRepLProp_CLProps
                     props = BRepLProp_CLProps(curve_adaptor, 1, 1e-6)
                     props.SetParameter(u_mid)
                     if props.IsTangentDefined():
                         t = props.Tangent()
-                        self.direction = np.array([t.X(), t.Y(), t.Z()], dtype=float)
-                        n = float(np.linalg.norm(self.direction))
-                        if n > 1e-12:
-                            self.direction = self.direction / n
-                        else:
-                            self.direction = np.array([1.0, 0.0, 0.0])
-                    else:
-                        self.direction = np.array([1.0, 0.0, 0.0])
+                        direction = np.array([t.X(), t.Y(), t.Z()], dtype=float)
                 except Exception:
-                    self.direction = np.array([1.0, 0.0, 0.0])
+                    direction = None
+
+            if direction is None or float(np.linalg.norm(direction)) < 1e-12:
+                direction = np.array([1.0, 0.0, 0.0], dtype=float)
+            else:
+                direction = np.asarray(direction, dtype=float)
+                direction = direction / float(np.linalg.norm(direction))
+
+            # Match edge orientation when OCC marks it reversed
+            try:
+                from OCC.Core.TopAbs import TopAbs_REVERSED
+                if self.edge.Orientation() == TopAbs_REVERSED:
+                    direction = -direction
+            except Exception:
+                pass
+
+            self.midpoint_model = np.asarray(mid, dtype=float)
+            self.midpoint = self.midpoint_model * float(self.unit_scale)
+            self.direction = direction
 
         except Exception as e:
             print(f"Warning: Could not calculate edge properties: {e}")
@@ -480,7 +498,8 @@ class GeometryUtils:
     @staticmethod
     def frame_from_edge(edge_props: EdgeProperties, name: str = "Edge Frame", unit_scale: float = 1.0) -> Frame:
         """
-        Create a Frame whose origin is the edge midpoint and Z-axis is the edge direction.
+        Create a Frame at the edge feature center (may be empty space for circles)
+        with Z along edge_props.direction (circle axis for circular edges, tangent/line dir otherwise).
         X-axis is aligned as closely as possible to the Global X-axis (Projection strategy).
         
         Args:
@@ -488,7 +507,7 @@ class GeometryUtils:
             name: Name for the frame
             unit_scale: Scale factor to convert model units to meters (deprecated, used in properties)
         """
-        # Z-axis is the edge direction
+        # Z-axis is the edge direction (or circle plane normal for circles)
         z_axis = np.array(edge_props.direction, dtype=float)
         if np.linalg.norm(z_axis) < 1e-8:
             z_axis = np.array([0.0, 0.0, 1.0])
