@@ -2,10 +2,14 @@
 Data structures for Multi-Body Dynamics Preprocessor
 """
 
-from typing import Optional, Dict, List
+from typing import Optional, Dict, List, Any
 import numpy as np
 from enum import Enum, auto
-from OCC.Core.TopoDS import TopoDS_Shape
+
+try:
+    from OCC.Core.TopoDS import TopoDS_Shape
+except ImportError:  # Allow headless unit tests without pythonocc
+    TopoDS_Shape = Any  # type: ignore
 
 
 class JointType(Enum):
@@ -112,8 +116,10 @@ class Joint:
             frame: Joint frame in global world coordinates
             axis: Axis of rotation/translation relative to the joint frame ("+X", "-X", "+Y", "-Y", "+Z", "-Z")
             
-        Note: Frame is stored in world coordinates since this is a preprocessor 
-              where bodies don't move. No local-to-global conversion is needed.
+        Note: Frame is stored in world coordinates at creation time. From it we
+        derive two body-local *markers* (marker1/marker2) which are the
+        quantities the kinematic solver actually constrains; they let the joint
+        move with its bodies (see core/kinematics/markers.py).
         """
         self.name = name
         self.joint_type = joint_type
@@ -121,6 +127,12 @@ class Joint:
         self.body2_id = body2_id
         self.frame = frame if frame is not None else Frame(name=f"{name}_Frame")
         self.axis = axis
+
+        # Body-local joint markers (kinematic solver formulation).
+        # Populated by capture at joint-creation time via
+        # core.kinematics.markers.capture_marker(). None until then.
+        self.marker1: Optional[Frame] = None
+        self.marker2: Optional[Frame] = None
         
         # Motor properties (add-on for revolute and prismatic joints)
         self.is_motorized: bool = False

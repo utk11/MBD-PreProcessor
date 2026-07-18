@@ -1,6 +1,39 @@
 
 
+import os
 import sys
+from pathlib import Path
+
+
+def _ensure_pyside6_qt_plugins() -> None:
+    """Prefer pip PySide6 platform plugins over conda qt6-main (version mismatch).
+
+    Conda may ship qt6-main 6.11 while pip PySide6 bundles Qt 6.10. With an empty
+    QT_PLUGIN_PATH, Qt can pick $CONDA_PREFIX/lib/qt6/plugins, reject those .so
+    files as incompatible, and fail with: Could not find the Qt platform plugin \"xcb\".
+    """
+    try:
+        import PySide6
+    except ImportError:
+        return
+    pyside_file = getattr(PySide6, "__file__", None)
+    if not pyside_file:
+        return
+    plugins = Path(pyside_file).resolve().parent / "Qt" / "plugins"
+    if not plugins.is_dir():
+        return
+    plugins_s = str(plugins)
+    # Prepend so PySide6 wins over any conda qt6 plugin dirs already on the path.
+    existing = [p for p in os.environ.get("QT_PLUGIN_PATH", "").split(os.pathsep) if p]
+    ordered = [plugins_s] + [p for p in existing if p != plugins_s]
+    os.environ["QT_PLUGIN_PATH"] = os.pathsep.join(ordered)
+    platforms = plugins / "platforms"
+    if platforms.is_dir():
+        os.environ["QT_QPA_PLATFORM_PLUGIN_PATH"] = str(platforms)
+
+
+_ensure_pyside6_qt_plugins()
+
 from PySide6.QtWidgets import (QApplication, QMainWindow, QWidget, QVBoxLayout,
                                 QFileDialog, QMenuBar, QMessageBox, QSplitter, QDialog)
 from PySide6.QtCore import Qt, QTimer, QThread, Signal
@@ -42,6 +75,9 @@ from visualization.motor_renderer import MotorRenderer
 
 # Import export module
 from export.exporter import AssemblyExporter
+
+# Kinematic assembly solver (SolveSpace-style position-level constraints)
+from core.kinematics import KinematicSolver, capture_joint_markers
 
 
 class StepLoadWorker(QThread):
@@ -309,6 +345,11 @@ class MainWindow(QMainWindow):
         create_joint_action = QAction("Create Joint...", self)
         create_joint_action.triggered.connect(self.create_joint)
         assembly_menu.addAction(create_joint_action)
+
+        solve_assembly_action = QAction("Solve Assembly", self)
+        solve_assembly_action.setShortcut("Ctrl+K")
+        solve_assembly_action.triggered.connect(self.solve_assembly)
+        assembly_menu.addAction(solve_assembly_action)
         
         assembly_menu.addSeparator()
         
@@ -456,6 +497,7 @@ class MainWindow(QMainWindow):
         self.last_vertex_selection = None
 
         self.assembly_state = None
+        self.selected_body_id = None
 
         # Cancel drag state
         if hasattr(self, 'viewer_3d') and self.viewer_3d:
@@ -463,6 +505,11 @@ class MainWindow(QMainWindow):
             self.viewer_3d._drag_start_screen = None
             self.viewer_3d._drag_start_world_pos = None
             self.viewer_3d._last_drag_screen = None
+            self.viewer_3d.selected_body_id = None
+            self.viewer_3d._left_press_screen = None
+            self.viewer_3d._left_press_body_id = None
+            self.viewer_3d._left_moved = False
+            self.viewer_3d._left_mode = None
 
         if hasattr(self, '_drag_update_timer'):
             self._drag_update_timer.stop()
@@ -587,14 +634,34 @@ class MainWindow(QMainWindow):
 
     def on_body_clicked_in_viewer(self, body_id: int):
         """
-        Handle body click selection from the 3D viewer
+        Handle body click selection from the 3D viewer.
 
         Args:
-            body_id: ID of the clicked body
+            body_id: ID of the clicked body, or -1 to clear selection (empty click)
         """
+        if body_id is None or body_id < 0:
+            self.clear_body_selection()
+            return
         # Update tree selection to match clicked body
         self.body_tree.select_body(body_id)
         # Tree selection will trigger on_body_selected automatically
+
+    def clear_body_selection(self):
+        """Clear the currently selected body so left-drag returns to camera pan."""
+        if self.selected_body_id is not None:
+            prev_body = next((b for b in self.bodies if b.id == self.selected_body_id), None)
+            if prev_body and prev_body.local_frame:
+                try:
+                    self.frame_renderer.remove_frame(prev_body.local_frame.name)
+                except Exception:
+                    pass
+        self.selected_body_id = None
+        self.viewer_3d.selected_body_id = None
+        try:
+            self.body_renderer.clear_highlight()
+        except Exception as e:
+            print(f"clear_body_selection highlight cleanup: {e}")
+        print("Body selection cleared")
 
     # ------------------------------------------------------------------
     # Mouse drag support (updates State and re-renders the body)
@@ -679,18 +746,43 @@ class MainWindow(QMainWindow):
                     return
 
             current_rot = body.get_world_rotation_matrix()
-            self.assembly_state.set_body_pose(body_id, new_pos, current_rot)
 
-            # Only the body visual transform here (light)
-            self.body_renderer.update_body_transform(body_id)
+            # If the body participates in any joint, solve the connected
+            # component with the mouse pose as a soft pin (SolveSpace-style).
+            moved_ids = [body_id]
+            if self.joints and self.assembly_state is not None:
+                connected = any(
+                    j.body1_id == body_id or j.body2_id == body_id
+                    for j in self.joints.values()
+                )
+                if connected:
+                    solver = self._make_kinematic_solver()
+                    rep = solver.solve_drag(
+                        body_id,
+                        new_pos,
+                        current_rot,
+                        pin_weight=1.0,
+                        max_iters=12,
+                        tol=1e-6,
+                        pin_orientation=False,
+                    )
+                    moved_ids = rep.moved_bodies or [body_id]
+                else:
+                    self.assembly_state.set_body_pose(body_id, new_pos, current_rot)
+            else:
+                self.assembly_state.set_body_pose(body_id, new_pos, current_rot)
 
-            # Sync any active face/edge/vertex highlight for this body so it follows the drag
-            self._sync_highlight_transforms(body_id)
-
-            # Keep local_frame data in sync (no render)
-            if self.selected_body_id == body_id and body.local_frame is not None:
-                body.local_frame.origin = new_pos.copy()
-                body.local_frame.rotation_matrix = current_rot.copy()
+            # Update body visuals for every body the solver touched
+            for bid in moved_ids:
+                self.body_renderer.update_body_transform(bid)
+                self._sync_highlight_transforms(bid)
+                self._sync_body_attached_frames(bid)
+                b = next((bb for bb in self.bodies if bb.id == bid), None)
+                if b is not None and b.local_frame is not None:
+                    pose = self.assembly_state.get_body_pose(bid)
+                    if pose is not None:
+                        b.local_frame.origin = pose.origin.copy()
+                        b.local_frame.rotation_matrix = pose.rotation_matrix.copy()
 
             # Push the change and repaint at controlled rate.
             # Redisplay was called with False in the renderer.
@@ -793,6 +885,7 @@ class MainWindow(QMainWindow):
         
         # Update selected body ID
         self.selected_body_id = body_id
+        self.viewer_3d.selected_body_id = body_id
         
         # Find the body and update property panel
         selected_body = None
@@ -1019,18 +1112,25 @@ class MainWindow(QMainWindow):
             frame_name = f"{base_name}_{suffix}"
             suffix += 1
 
+        # Origin/orientation in body geometry space (meters). Do NOT bake State
+        # pose here — the body's AIS LocalTransformation is applied at render
+        # time, matching face highlights exactly.
         frame = GeometryUtils.frame_from_face(face_props, name=frame_name, unit_scale=self.unit_scale)
-        
+
         self.created_frames[frame_name] = frame
-        self.frame_to_body_map[frame_name] = body_id  # Track frame-to-body association
-        self.frame_renderer.render_frame(frame, visible=True)
-        
-        # Update frame tree and select new frame
+        self.frame_to_body_map[frame_name] = body_id
+        trsf = self._body_ais_local_trsf(body_id)
+        self.frame_renderer.render_frame(frame, visible=True, local_trsf=trsf)
+
         self.body_tree.update_frames(self.created_frames.values())
         self.body_tree.select_frame(frame_name)
-        
+
         self.property_panel.show_frame_properties(frame)
-        print(f"Created frame '{frame_name}' from face {face_index} on body {body_id}")
+        cm = getattr(face_props, "center_model", None)
+        print(
+            f"Created frame '{frame_name}' from face {face_index} on body {body_id} "
+            f"origin_m={frame.origin} center_model={cm}"
+        )
 
     def on_create_frame_from_edge(self):
         """Create and render a frame from the last selected edge"""
@@ -1053,18 +1153,18 @@ class MainWindow(QMainWindow):
             suffix += 1
 
         frame = GeometryUtils.frame_from_edge(edge_props, name=frame_name, unit_scale=self.unit_scale)
-        
+
         self.created_frames[frame_name] = frame
-        self.frame_to_body_map[frame_name] = body_id  # Track frame-to-body association
-        self.frame_renderer.render_frame(frame, visible=True)
-        
-        # Update frame tree and select new frame
+        self.frame_to_body_map[frame_name] = body_id
+        trsf = self._body_ais_local_trsf(body_id)
+        self.frame_renderer.render_frame(frame, visible=True, local_trsf=trsf)
+
         self.body_tree.update_frames(self.created_frames.values())
         self.body_tree.select_frame(frame_name)
-        
+
         self.property_panel.show_frame_properties(frame)
-        print(f"Created frame '{frame_name}' from edge {edge_index} on body {body_id}")
-    
+        print(f"Created frame '{frame_name}' from edge {edge_index} on body {body_id} at {frame.origin}")
+
     def on_create_frame_from_vertex(self):
         """Create and render a frame from the last selected vertex"""
         if not self.last_vertex_selection:
@@ -1086,19 +1186,66 @@ class MainWindow(QMainWindow):
             suffix += 1
 
         frame = GeometryUtils.frame_from_vertex(vertex_props, name=frame_name)
-        
+
         self.created_frames[frame_name] = frame
-        # Track frame-to-body association if we have a selected body
-        if self.selected_body_id is not None:
-            self.frame_to_body_map[frame_name] = self.selected_body_id
-        self.frame_renderer.render_frame(frame, visible=True)
-        
-        # Update frame tree and select new frame
+        self.frame_to_body_map[frame_name] = body_id
+        trsf = self._body_ais_local_trsf(body_id)
+        self.frame_renderer.render_frame(frame, visible=True, local_trsf=trsf)
+
         self.body_tree.update_frames(self.created_frames.values())
         self.body_tree.select_frame(frame_name)
-        
+
         self.property_panel.show_frame_properties(frame)
-        print(f"Created frame '{frame_name}' from vertex {vertex_index} on body {body_id}")
+        print(f"Created frame '{frame_name}' from vertex {vertex_index} on body {body_id} at {frame.origin}")
+
+    def _body_ais_local_trsf(self, body_id: int):
+        """Return the body's current AIS LocalTransformation (or None)."""
+        try:
+            ais = self.body_renderer.body_ais_shapes.get(body_id)
+            if ais is None:
+                return None
+            return ais.LocalTransformation()
+        except Exception:
+            return None
+
+    def _sync_body_attached_frames(self, body_id: int):
+        """Keep user frames parented to a body aligned after pose changes."""
+        trsf = self._body_ais_local_trsf(body_id)
+        for fname, bid in list(self.frame_to_body_map.items()):
+            if bid == body_id and fname in self.created_frames:
+                try:
+                    self.frame_renderer.update_frame_local_trsf(fname, trsf)
+                except Exception:
+                    # Fallback: full re-render
+                    try:
+                        self.frame_renderer.render_frame(
+                            self.created_frames[fname], visible=True, local_trsf=trsf
+                        )
+                    except Exception as e:
+                        print(f"Frame sync failed for {fname}: {e}")
+
+    def _body_delta_transform(self, body_id: int):
+        """Return (delta_origin_m, delta_rot) mapping original geometry → current world.
+
+        Matches BodyRenderer.update_body_transform. Kept for solvers/export helpers.
+        """
+        if self.assembly_state is None:
+            return np.zeros(3), np.eye(3)
+        desired = self.assembly_state.get_body_pose(body_id)
+        if desired is None:
+            return np.zeros(3), np.eye(3)
+        base = self.body_renderer._base_poses.get(body_id)
+        if base is None:
+            return np.zeros(3), np.eye(3)
+        delta_rot = desired.rotation_matrix @ base.rotation_matrix.T
+        delta_origin = desired.origin - (delta_rot @ base.origin)
+        return delta_origin, delta_rot
+
+    def _apply_body_pose_to_frame(self, frame: Frame, body_id: int):
+        """Transform a frame defined in original body geometry space into world space."""
+        delta_origin, delta_rot = self._body_delta_transform(body_id)
+        frame.origin = delta_rot @ np.asarray(frame.origin, dtype=float) + delta_origin
+        frame.rotation_matrix = delta_rot @ np.asarray(frame.rotation_matrix, dtype=float)
     
     def on_frame_selected(self, frame_name: str):
         """Handle frame selection from tree"""
@@ -1196,6 +1343,7 @@ class MainWindow(QMainWindow):
         # Clear selection if this was the selected body
         if self.selected_body_id == body_id:
             self.selected_body_id = None
+            self.viewer_3d.selected_body_id = None
             self.property_panel.show_no_selection()
         
         # Update GUI
@@ -1309,6 +1457,7 @@ class MainWindow(QMainWindow):
         # Clear selection if any deleted body was selected
         if self.selected_body_id in body_ids:
             self.selected_body_id = None
+            self.viewer_3d.selected_body_id = None
             self.property_panel.show_no_selection()
         
         # Update GUI
@@ -1443,6 +1592,16 @@ class MainWindow(QMainWindow):
 
             # Create Joint (with single frame)
             joint = Joint(name, j_type, b1_id, b2_id, frame, axis)
+
+            # Capture body-local markers so the joint moves with its bodies
+            # and the kinematic solver can constrain it (SolveSpace-style).
+            try:
+                p1 = self._body_pose_tuple(b1_id)
+                p2 = self._body_pose_tuple(b2_id)
+                capture_joint_markers(joint, p1, p2)
+            except Exception as e:
+                print(f"Warning: failed to capture joint markers for '{name}': {e}")
+
             self.joints[name] = joint
             
             print(f"Created joint: {joint}")
@@ -1453,7 +1612,110 @@ class MainWindow(QMainWindow):
             # Render Joint
             self.joint_renderer.render_joint(joint)
             
-            # TODO: Add logic to store joint in an Assembly object if we had one centrally
+    def _body_pose_tuple(self, body_id: int):
+        """Return (origin, rotation_matrix) for a body (or ground) in world coords."""
+        if body_id == -1:
+            if self.ground_body and self.ground_body.local_frame is not None:
+                f = self.ground_body.local_frame
+                return f.origin.copy(), f.rotation_matrix.copy()
+            return np.zeros(3), np.eye(3)
+
+        if self.assembly_state is not None:
+            pose = self.assembly_state.get_body_pose(body_id)
+            if pose is not None:
+                return pose.origin.copy(), pose.rotation_matrix.copy()
+
+        body = next((b for b in self.bodies if b.id == body_id), None)
+        if body is not None and body.local_frame is not None:
+            return body.local_frame.origin.copy(), body.local_frame.rotation_matrix.copy()
+        return np.zeros(3), np.eye(3)
+
+    def _make_kinematic_solver(self) -> KinematicSolver:
+        """Build a KinematicSolver over the current assembly State/joints."""
+        if self.assembly_state is None:
+            raise RuntimeError("No assembly state — load a STEP file first.")
+        # Ensure every joint has markers (legacy joints / project load).
+        for joint in self.joints.values():
+            if joint.marker1 is None or joint.marker2 is None:
+                try:
+                    capture_joint_markers(
+                        joint,
+                        self._body_pose_tuple(joint.body1_id),
+                        self._body_pose_tuple(joint.body2_id),
+                    )
+                except Exception as e:
+                    print(f"Warning: could not capture markers for joint '{joint.name}': {e}")
+
+        return KinematicSolver(
+            bodies=self.bodies,
+            joints=list(self.joints.values()),
+            state=self.assembly_state,
+            ground_id=-1,
+            ground_pose=self._body_pose_tuple(-1),
+        )
+
+    def solve_assembly(self):
+        """Snap all body poses so joint constraints are satisfied (Ctrl+K)."""
+        if not self.bodies:
+            QMessageBox.warning(self, "No Bodies", "Load a STEP file before solving.")
+            return
+        if not self.joints:
+            QMessageBox.information(self, "No Joints", "Create joints before solving the assembly.")
+            return
+        if self.assembly_state is None:
+            QMessageBox.warning(self, "No State", "Assembly state is not initialized.")
+            return
+
+        try:
+            solver = self._make_kinematic_solver()
+            report = solver.solve_assembly(max_iters=80, tol=1e-9, analyze=True)
+        except Exception as e:
+            import traceback
+            traceback.print_exc()
+            QMessageBox.critical(self, "Solve Error", f"Kinematic solve failed:\n{e}")
+            return
+
+        # Apply visuals for every body
+        for body in self.bodies:
+            self.body_renderer.update_body_transform(body.id)
+            self._sync_highlight_transforms(body.id)
+            self._sync_body_attached_frames(body.id)
+            pose = self.assembly_state.get_body_pose(body.id)
+            if pose is not None and body.local_frame is not None:
+                body.local_frame.origin = pose.origin.copy()
+                body.local_frame.rotation_matrix = pose.rotation_matrix.copy()
+
+        # Refresh joint visuals (frames are still world-defined at creation;
+        # markers drive the solver — joint display may lag slightly until
+        # joint_renderer is updated to draw marker frames).
+        for joint in self.joints.values():
+            self.joint_renderer.render_joint(joint)
+
+        self.display.Context.UpdateCurrentViewer()
+        self.display.Repaint()
+
+        # Status / feedback
+        residual_lines = [
+            f"  {name}: {res:.3e}"
+            for name, res in sorted(report.per_joint_residual.items())
+        ]
+        residual_txt = "\n".join(residual_lines) if residual_lines else "  (none)"
+        red = ", ".join(report.redundant_joints) if report.redundant_joints else "none"
+        msg = (
+            f"{'Converged' if report.converged else 'Did not fully converge'}\n"
+            f"Iterations: {report.iterations}\n"
+            f"Max residual: {report.max_residual:.3e}\n"
+            f"Estimated DOF: {report.dof}\n"
+            f"Redundant joints: {red}\n\n"
+            f"Per-joint residual norms:\n{residual_txt}"
+        )
+        print(f"Solve Assembly: {msg}")
+        self.statusBar().showMessage(
+            f"Solve {'OK' if report.converged else 'partial'} | "
+            f"DOF={report.dof} | max res={report.max_residual:.2e}",
+            8000,
+        )
+        QMessageBox.information(self, "Solve Assembly", msg)
             
     def on_joint_selected(self, joint_name: str):
         """Handle joint selection in tree"""
@@ -2050,6 +2312,17 @@ class MainWindow(QMainWindow):
                     frame=frame,
                     axis=joint_data.get("axis", "+Z")
                 )
+
+                # Capture markers if state is already available (STEP load may still be async)
+                if self.assembly_state is not None:
+                    try:
+                        capture_joint_markers(
+                            joint,
+                            self._body_pose_tuple(joint.body1_id),
+                            self._body_pose_tuple(joint.body2_id),
+                        )
+                    except Exception as e:
+                        print(f"Warning: marker capture deferred for '{joint.name}': {e}")
                 
                 self.joints[joint.name] = joint
                 self.joint_renderer.render_joint(joint)

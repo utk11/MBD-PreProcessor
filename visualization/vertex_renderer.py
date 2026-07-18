@@ -9,7 +9,7 @@ from OCC.Core.AIS import AIS_Shape
 from OCC.Core.TopoDS import TopoDS_Vertex
 from OCC.Core.BRep import BRep_Tool
 from OCC.Core.BRepPrimAPI import BRepPrimAPI_MakeSphere
-from OCC.Core.gp import gp_Pnt
+from OCC.Core.gp import gp_Pnt, gp_Trsf
 from OCC.Display.OCCViewer import Viewer3d
 
 

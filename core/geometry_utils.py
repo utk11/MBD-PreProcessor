@@ -39,57 +39,108 @@ class FaceProperties:
         self._calculate_properties()
     
     def _calculate_properties(self):
-        """Calculate area, center, and normal for the face"""
-        # Calculate area using GProp
+        """Calculate area, center, and normal for the face.
+
+        Center is the surface mass-centre projected back onto the face so the
+        point always lies on the visible geometry (planar faces → true center;
+        cylinders → on the wall, not the axis).
+        Coordinates from OCC are model units; ``center`` is stored in meters.
+        ``center_model`` keeps the raw OCC coordinates for display alignment.
+        """
+        from OCC.Core.BRepLProp import BRepLProp_SLProps
+        from OCC.Core.BRepAdaptor import BRepAdaptor_Surface
+        from OCC.Core.Extrema import Extrema_ExtPS
+        from OCC.Core.gp import gp_Pnt
+
         system = GProp_GProps()
         brepgprop.SurfaceProperties(self.face, system)
         self.area = system.Mass() * (self.unit_scale ** 2)
-        
-        # Get center of mass
-        mass_center = system.CentreOfMass()
-        self.center = np.array([mass_center.X(), mass_center.Y(), mass_center.Z()]) * self.unit_scale
-        
-        # Calculate normal at the center point
-        self._calculate_normal()
-    
-    def _calculate_normal(self):
-        """Calculate the normal vector at the face center"""
+
+        self.center_model = np.array([0.0, 0.0, 0.0], dtype=float)
+        self.normal = np.array([0.0, 0.0, 1.0], dtype=float)
+
         try:
-            from OCC.Core.BRepBuilderAPI import BRepBuilderAPI_MakeFace
-            from OCC.Core.BRepLProp import BRepLProp_SLProps
-            from OCC.Core.BRepAdaptor import BRepAdaptor_Surface
-            
-            # Get surface from face
-            surface_adaptor = BRepAdaptor_Surface(self.face)
-            
-            # Get parametric bounds
-            u_min = surface_adaptor.FirstUParameter()
-            u_max = surface_adaptor.LastUParameter()
-            v_min = surface_adaptor.FirstVParameter()
-            v_max = surface_adaptor.LastVParameter()
-            
-            # Use middle of parametric space
-            u_mid = (u_min + u_max) / 2.0
-            v_mid = (v_min + v_max) / 2.0
-            
-            # Evaluate properties at the midpoint
-            # Degree 2 is often better for checking curvature, but 1 is sufficient for normal
+            # Restriction=True → UV domain of the face; locations applied on Value()
+            surface_adaptor = BRepAdaptor_Surface(self.face, True)
+
+            mass_center = system.CentreOfMass()
+            seed = gp_Pnt(mass_center.X(), mass_center.Y(), mass_center.Z())
+
+            # Project COM onto the surface so the origin is on the face
+            u_use = None
+            v_use = None
+            p_use = None
+            try:
+                ext = Extrema_ExtPS(seed, surface_adaptor, 1e-7, 1e-7)
+                if ext.IsDone() and ext.NbExt() > 0:
+                    best_i = 1
+                    best_d = ext.SquareDistance(1)
+                    for i in range(2, ext.NbExt() + 1):
+                        d = ext.SquareDistance(i)
+                        if d < best_d:
+                            best_d = d
+                            best_i = i
+                    p_use = ext.Point(best_i).Value()
+                    try:
+                        # Extrema_POnSurf.Parameter() → (u, v) in pythonocc
+                        uv = ext.Point(best_i).Parameter()
+                        if isinstance(uv, (tuple, list)) and len(uv) >= 2:
+                            u_use, v_use = float(uv[0]), float(uv[1])
+                        else:
+                            u_use = float(uv)
+                            v_use = float(ext.Point(best_i).Parameter(2)) if False else u_use
+                    except Exception:
+                        # Recover UV by re-projecting via adaptor bounds midpoint as last resort
+                        u_use = None
+                        v_use = None
+            except Exception as proj_err:
+                print(f"Face {self.face_index}: surface projection failed ({proj_err}); using UV mid")
+
+            if p_use is None or u_use is None or v_use is None:
+                u_min = surface_adaptor.FirstUParameter()
+                u_max = surface_adaptor.LastUParameter()
+                v_min = surface_adaptor.FirstVParameter()
+                v_max = surface_adaptor.LastVParameter()
+                if u_use is None:
+                    u_use = 0.5 * (u_min + u_max)
+                if v_use is None:
+                    v_use = 0.5 * (v_min + v_max)
+                if p_use is None:
+                    p_use = surface_adaptor.Value(u_use, v_use)
+
+            self.center_model = np.array(
+                [p_use.X(), p_use.Y(), p_use.Z()], dtype=float
+            )
+            self.center = self.center_model * float(self.unit_scale)
+
             props = BRepLProp_SLProps(surface_adaptor, 1, 1e-7)
-            props.SetParameters(u_mid, v_mid)
-            
-            # Get normal if defined
+            props.SetParameters(float(u_use), float(v_use))
             if props.IsNormalDefined():
                 n_dir = props.Normal()
-                self.normal = np.array([n_dir.X(), n_dir.Y(), n_dir.Z()])
+                self.normal = np.array([n_dir.X(), n_dir.Y(), n_dir.Z()], dtype=float)
+                try:
+                    from OCC.Core.TopAbs import TopAbs_REVERSED
+                    if self.face.Orientation() == TopAbs_REVERSED:
+                        self.normal = -self.normal
+                except Exception:
+                    pass
+                nrm = float(np.linalg.norm(self.normal))
+                if nrm > 1e-12:
+                    self.normal = self.normal / nrm
             else:
-                # Use default normal if not defined (e.g. singularity)
-                print(f"Warning: Normal not defined for face {self.face_index} at ({u_mid}, {v_mid}).")
-                self.normal = np.array([0.0, 0.0, 1.0])
-                
+                self.normal = np.array([0.0, 0.0, 1.0], dtype=float)
         except Exception as e:
-            # Default normal if anything fails
-            print(f"Warning: Normal calculation failed for face {self.face_index}: {e}. Using default normal (0,0,1).")
-            self.normal = np.array([0.0, 0.0, 1.0])
+            print(f"Warning: face center/normal failed for face {self.face_index}: {e}")
+            try:
+                mass_center = system.CentreOfMass()
+                self.center_model = np.array(
+                    [mass_center.X(), mass_center.Y(), mass_center.Z()], dtype=float
+                )
+                self.center = self.center_model * float(self.unit_scale)
+            except Exception:
+                self.center_model = np.zeros(3)
+                self.center = np.zeros(3)
+            self.normal = np.array([0.0, 0.0, 1.0], dtype=float)
     
     def __repr__(self):
         return (f"FaceProperties(index={self.face_index}, "
@@ -117,16 +168,20 @@ class VertexProperties:
         self._calculate_properties()
     
     def _calculate_properties(self):
-        """Calculate coordinates for the vertex"""
+        """Calculate coordinates for the vertex.
+
+        BRep_Tool.Pnt already returns the point with the vertex location applied.
+        """
         try:
-            # Get point from vertex using BRep_Tool
+            from OCC.Core.BRep import BRep_Tool
             pnt = BRep_Tool.Pnt(self.vertex)
-            # Scale to meters
-            self.coordinates = np.array([pnt.X() * self.unit_scale, 
-                                        pnt.Y() * self.unit_scale, 
-                                        pnt.Z() * self.unit_scale])
+            self.coordinates_model = np.array(
+                [pnt.X(), pnt.Y(), pnt.Z()], dtype=float
+            )
+            self.coordinates = self.coordinates_model * float(self.unit_scale)
         except Exception as e:
             print(f"Warning: Could not calculate vertex properties: {e}")
+            self.coordinates_model = np.array([0.0, 0.0, 0.0])
             self.coordinates = np.array([0.0, 0.0, 0.0])
     
     def __repr__(self):
@@ -155,43 +210,59 @@ class EdgeProperties:
         self._calculate_properties()
     
     def _calculate_properties(self):
-        """Calculate length, midpoint, and direction for the edge"""
-        from OCC.Core.BRepBuilderAPI import BRepBuilderAPI_MakeEdge
-        from OCC.Core.BRepLProp import BRepLProp_CLProps
-        from OCC.Core.GeomAPI import GeomAPI_ProjectPointOnCurve
-        
+        """Calculate length, midpoint, and direction for the edge.
+
+        Uses BRepAdaptor_Curve.Value so the edge TopLoc_Location is applied
+        (reading the underlying Geom_Curve alone drops assembly placement).
+        """
         try:
-            # Get edge curve
             from OCC.Core.BRepAdaptor import BRepAdaptor_Curve
+
             curve_adaptor = BRepAdaptor_Curve(self.edge)
-            curve = curve_adaptor.Curve().Curve()
-            
-            # Get parameter range
             u_min = curve_adaptor.FirstParameter()
             u_max = curve_adaptor.LastParameter()
-            
-            # Calculate length as distance between endpoints
-            start_pnt = curve.Value(u_min)
-            end_pnt = curve.Value(u_max)
-            
-            start = np.array([start_pnt.X(), start_pnt.Y(), start_pnt.Z()])
-            end = np.array([end_pnt.X(), end_pnt.Y(), end_pnt.Z()])
-            
-            self.length = np.linalg.norm(end - start) * self.unit_scale
-            
-            # Midpoint is average of start and end
-            self.midpoint = ((start + end) / 2.0) * self.unit_scale
-            
-            # Direction is normalized vector from start to end
+            u_mid = 0.5 * (u_min + u_max)
+
+            # Value() returns points in world/model coords with location applied
+            start_pnt = curve_adaptor.Value(u_min)
+            end_pnt = curve_adaptor.Value(u_max)
+            mid_pnt = curve_adaptor.Value(u_mid)
+
+            start = np.array([start_pnt.X(), start_pnt.Y(), start_pnt.Z()], dtype=float)
+            end = np.array([end_pnt.X(), end_pnt.Y(), end_pnt.Z()], dtype=float)
+            mid = np.array([mid_pnt.X(), mid_pnt.Y(), mid_pnt.Z()], dtype=float)
+
+            self.length = float(np.linalg.norm(end - start)) * float(self.unit_scale)
+            self.midpoint_model = mid
+            self.midpoint = mid * float(self.unit_scale)
+
             direction = end - start
-            length = np.linalg.norm(direction)
+            length = float(np.linalg.norm(direction))
             if length > 1e-10:
                 self.direction = direction / length
             else:
-                self.direction = np.array([1.0, 0.0, 0.0])
-                
+                # Degenerate edge — try curve tangent at mid
+                try:
+                    from OCC.Core.BRepLProp import BRepLProp_CLProps
+                    props = BRepLProp_CLProps(curve_adaptor, 1, 1e-6)
+                    props.SetParameter(u_mid)
+                    if props.IsTangentDefined():
+                        t = props.Tangent()
+                        self.direction = np.array([t.X(), t.Y(), t.Z()], dtype=float)
+                        n = float(np.linalg.norm(self.direction))
+                        if n > 1e-12:
+                            self.direction = self.direction / n
+                        else:
+                            self.direction = np.array([1.0, 0.0, 0.0])
+                    else:
+                        self.direction = np.array([1.0, 0.0, 0.0])
+                except Exception:
+                    self.direction = np.array([1.0, 0.0, 0.0])
+
         except Exception as e:
             print(f"Warning: Could not calculate edge properties: {e}")
+            self.midpoint_model = np.array([0.0, 0.0, 0.0])
+            self.midpoint = np.array([0.0, 0.0, 0.0])
             self.direction = np.array([1.0, 0.0, 0.0])
     
     def __repr__(self):

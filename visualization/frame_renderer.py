@@ -27,6 +27,7 @@ class FrameRenderer:
         self.frame_visible: Dict[str, bool] = {}  # frame_name -> visibility state
         self.frame_highlighted: Dict[str, bool] = {}  # frame_name -> highlight state
         self.frame_original_colors: Dict[str, list] = {}  # frame_name -> [original colors]
+        self.frame_local_trsf: Dict[str, object] = {}  # frame_name -> gp_Trsf or None
         self.unit_scale = 1.0  # Scale factor (Meters per Model Unit)
         
         # Default axis parameters
@@ -57,44 +58,54 @@ class FrameRenderer:
         self.unit_scale = scale
         print(f"FrameRenderer unit scale set to {scale}")
 
-    def render_frame(self, frame: Frame, visible: bool = True):
+    def render_frame(self, frame: Frame, visible: bool = True, local_trsf=None):
         """
-        Render a coordinate frame as RGB axes
-        
+        Render a coordinate frame as RGB axes.
+
         Args:
-            frame: The Frame object to render
+            frame: The Frame object to render. ``frame.origin`` is in **meters**
+                   in the same coordinate space as body geometry before the
+                   body's AIS local transform (shape space), OR already in
+                   world meters if ``local_trsf`` is None and the pose was baked.
             visible: Whether the frame should be initially visible
+            local_trsf: Optional ``gp_Trsf`` (typically the parent body's
+                        ``AIS_Shape.LocalTransformation()``). When set, axes are
+                        built in geometry/model space and this transform is applied
+                        — the same path used for face/edge highlights — so the
+                        triad sits exactly on the selected geometry.
         """
         # Remove existing frame if already rendered
         if frame.name in self.frame_shapes:
             self.remove_frame(frame.name)
-        
+
         shapes = []
-        
+
         # Scale origin from Meters to Model Units for display
-        # origin (meters) / scale (meters/unit) = origin (units)
-        render_origin = frame.origin / self.unit_scale
-        
+        scale = self.unit_scale if self.unit_scale and abs(self.unit_scale) > 1e-30 else 1.0
+        render_origin = np.asarray(frame.origin, dtype=float) / scale
+
         # X-axis (Red)
         x_axis = frame.get_x_axis()
         x_shapes = self._create_axis(render_origin, x_axis, Quantity_Color(1.0, 0.0, 0.0, Quantity_TOC_RGB))
         shapes.extend(x_shapes)
-        
+
         # Y-axis (Green)
         y_axis = frame.get_y_axis()
         y_shapes = self._create_axis(render_origin, y_axis, Quantity_Color(0.0, 1.0, 0.0, Quantity_TOC_RGB))
         shapes.extend(y_shapes)
-        
+
         # Z-axis (Blue)
         z_axis = frame.get_z_axis()
         z_shapes = self._create_axis(render_origin, z_axis, Quantity_Color(0.0, 0.0, 1.0, Quantity_TOC_RGB))
         shapes.extend(z_shapes)
-        
+
         # Store shapes and their original colors
         self.frame_shapes[frame.name] = shapes
         self.frame_visible[frame.name] = visible
         self.frame_highlighted[frame.name] = False
-        
+        self.frame_local_trsf = getattr(self, "frame_local_trsf", {})
+        self.frame_local_trsf[frame.name] = local_trsf
+
         # Store original colors (Red, Red, Green, Green, Blue, Blue for X, Y, Z axes)
         original_colors = [
             Quantity_Color(1.0, 0.0, 0.0, Quantity_TOC_RGB),  # X cylinder
@@ -105,15 +116,41 @@ class FrameRenderer:
             Quantity_Color(0.0, 0.0, 1.0, Quantity_TOC_RGB)   # Z cone
         ]
         self.frame_original_colors[frame.name] = original_colors
-        
-        # Display shapes
+
+        # Display shapes and apply the same local transform the body uses
         if visible:
             for shape in shapes:
                 self.display.Context.Display(shape, False)
-        
+                if local_trsf is not None:
+                    try:
+                        shape.SetLocalTransformation(local_trsf)
+                        self.display.Context.Redisplay(shape, False)
+                    except Exception as e:
+                        print(f"Warning: could not apply local_trsf to frame '{frame.name}': {e}")
+
         self.display.Context.UpdateCurrentViewer()
-        
-        print(f"Frame '{frame.name}' rendered at {frame.origin} (visible: {visible})")
+
+        print(
+            f"Frame '{frame.name}' rendered at origin_m={frame.origin} "
+            f"model={render_origin} trsf={'yes' if local_trsf is not None else 'no'} "
+            f"(visible: {visible})"
+        )
+
+    def update_frame_local_trsf(self, frame_name: str, local_trsf):
+        """Re-apply a body's local transform to an already-rendered frame (e.g. after drag)."""
+        if frame_name not in self.frame_shapes:
+            return
+        if not hasattr(self, "frame_local_trsf"):
+            self.frame_local_trsf = {}
+        self.frame_local_trsf[frame_name] = local_trsf
+        for shape in self.frame_shapes[frame_name]:
+            try:
+                if local_trsf is not None:
+                    shape.SetLocalTransformation(local_trsf)
+                self.display.Context.Redisplay(shape, False)
+            except Exception:
+                pass
+        self.display.Context.UpdateCurrentViewer()
     
     def _create_axis(self, origin: np.ndarray, direction: np.ndarray, color: Quantity_Color) -> list:
         """
