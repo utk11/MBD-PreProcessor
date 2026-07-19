@@ -1,806 +1,876 @@
-# MBD Pre-Processor — Systems Architecture & Kinematic Solver
+# MBD Pre-Processor Architecture
 
-**Purpose**  
-Document the codebase **from first principles** using **systems thinking**: what the system is for, what must stay invariant, what is mutable, how information flows, which feedback loops create interactive behavior, and where leverage lives. Emphasis is on the **position-level kinematic assembly solver** (`core/kinematics/`) and how it plugs into pose, joints, drag, and rendering without mutating CAD geometry.
+This document explains how the repository turns a static STEP assembly into an editable multi-body model. It follows the data from the CAD file, through geometry and physical-property extraction, into frames, joints, loads, body poses, the kinematic solver, the 3D view, and finally the exported files.
 
-This is **not** an API reference dump. It explains *why* the pieces exist and how they produce the emergent behavior: “I drag one part and the mechanism moves as if it were assembled.”
+The application is a **pre-processor**, not a dynamics simulator. It prepares geometry and model definitions and contains a position-level kinematic assembly solver. It does not integrate equations of motion, calculate accelerations, detect contact, or apply forces and motors to simulate time.
 
----
-
-## 0. First principles — what problem does this software solve?
-
-### 0.1 The product purpose
-
-MBD Pre-Processor is a **socio-technical bridge** between:
-
-1. **CAD truth** — B-Rep geometry from STEP (what the parts *are*).
-2. **Mechanism truth** — bodies + joints + poses that a dynamics solver can consume (how the parts *move relative to each other*).
-3. **Human intent** — interactive placement and joint definition via a 3D GUI.
-
-The human’s job is to turn a static multi-solid import into a **kinematic assembly**: rigid bodies, joint types, frames/markers, optional loads/motors, export.
-
-### 0.2 The three layers of truth (invariants vs mutables)
-
-From first principles, three kinds of information must not be confused:
-
-| Layer | Question it answers | Mutability | Primary types |
-|-------|---------------------|------------|---------------|
-| **Geometry** | What is the solid? | Immutable after load | `TopoDS_Shape` on `RigidBody` |
-| **Intrinsic body frame** | Where is the COM / body axes relative to the solid? | Fixed at physics init (conceptually intrinsic) | `RigidBody.local_frame`, volume, COM, inertia |
-| **Extrinsic pose** | Where is this body in the world *right now*? | Highly mutable | `State.body_poses` → `Pose` |
-| **Joint definition** | How may two bodies move relative to each other? | Created by user; markers frozen at creation | `Joint` + `marker1`/`marker2` |
-| **Constraint satisfaction** | Are the poses consistent with the joints? | Recomputed continuously | `KinematicSolver` residuals |
-
-If geometry and pose are fused (move by mutating B-Rep), interactive 6DOF editing and constraint solving become expensive and irreversible. The core design decision is:
-
-> **Pose is externalized into `State`. Display uses OCC local transforms. Constraints act on poses via body-local joint markers.**
-
-### 0.3 What the kinematic solver is *not*
-
-- Not dynamics (no mass, forces, time integration in the solve loop).
-- Not mesh collision.
-- Not CAD feature history.
-- Not a replacement for the downstream MBD simulator.
-
-It answers only:
-
-> Given joints and a desired placement intent (mouse pin or “snap everything”), what body poses make Φ(q) ≈ 0?
-
----
-
-## 1. High-level architecture (systems view)
+## 1. Architecture at a glance
 
 ```mermaid
-graph TB
-    subgraph InputBoundary["Input boundary"]
-        User[User]
-        Viewer[SelectableViewer3d]
-        Menus[Menus / Dialogs]
-    end
+flowchart LR
+    STEP["STEP file<br/>CAD coordinates"] --> Worker["STEP load worker"]
+    Worker --> Parser["STEP parser<br/>shape + unit scale"]
+    Parser --> Bodies["RigidBody objects<br/>OpenCASCADE shapes"]
+    Bodies --> Physics["Physical-property calculator"]
+    Physics --> Domain["Domain model<br/>bodies, COM, inertia, frames"]
 
-    subgraph Coordination["Coordinator"]
-        Main[MainWindow]
-    end
+    User["User input"] --> UI["MainWindow + Qt panels"]
+    UI --> Selection["OCC selection<br/>body / face / edge / vertex"]
+    Selection --> Features["Geometry properties"]
+    Features --> Frames["Reference frames"]
+    Frames --> Definitions["Joints, forces, torques, motors"]
 
-    subgraph Domain["Domain model"]
-        Bodies[RigidBody list]
-        Joints[Joint dict]
-        State[State body_poses]
-        Frames[User Frames]
-        Loads[Forces / Torques / Motors]
-    end
+    Domain --> State["State<br/>current world poses"]
+    Definitions --> Solver["Kinematic solver"]
+    State <--> Solver
 
-    subgraph ConstraintLayer["Constraint layer NEW"]
-        Markers[markers.py SE3 / markers]
-        Graph[JointGraph union-find]
-        Constraints[JointConstraint Φ, J]
-        Solver[KinematicSolver LM]
-    end
+    Domain --> Renderers["Visualization adapters"]
+    Frames --> Renderers
+    Definitions --> Renderers
+    State --> Renderers
+    Renderers --> Viewer["OpenCASCADE 3D viewer"]
+    Viewer --> User
 
-    subgraph View["View / OCC"]
-        BodyR[BodyRenderer delta gp_Trsf]
-        SubR[Face/Edge/Vertex renderers]
-        JointR[JointRenderer]
-        OtherR[Force/Torque/Motor/Frame]
-        AIS[OCC AIS_Shape / V3d]
-    end
-
-    subgraph Infra["Infrastructure"]
-        Worker[StepLoadWorker QThread]
-        Parser[StepParser]
-        Physics[PhysicsCalculator]
-        Export[AssemblyExporter]
-    end
-
-    User --> Viewer
-    User --> Menus
-    Viewer --> Main
-    Menus --> Main
-    Main --> State
-    Main --> Bodies
-    Main --> Joints
-    Main --> Solver
-    Bodies --> State
-    Joints --> Graph
-    Joints --> Constraints
-    Graph --> Solver
-    Constraints --> Solver
-    Markers --> Constraints
-    Solver -->|set_body_pose| State
-    State --> BodyR
-    BodyR --> AIS
-    Main --> BodyR
-    Main --> Worker
-    Worker --> Parser
-    Worker --> Physics
-    Main --> Export
+    Domain --> Exporter["Assembly exporter"]
+    Frames --> Exporter
+    Definitions --> Exporter
+    Exporter --> Output["JSON + OBJ meshes"]
 ```
 
-### Systems vocabulary for this app
+The central design rule is:
 
-| Concept | Meaning here |
-|---------|----------------|
-| **Boundary** | Geometry stays immutable; pose mutates only in `State`; solver is pure numpy (no OCC). |
-| **Stock** | Body poses in `State`; joint markers once captured. |
-| **Flow** | Mouse deltas → desired pin → solver → pose updates → AIS transforms → pixels. |
-| **Feedback** | Visual motion changes the next mouse intent (reinforcing). Constraint residuals pull poses back (balancing). |
-| **Delay** | Drag timer throttling; LM iterations per tick. |
-| **Leverage** | `State` write path; marker capture at joint creation; drag hook calling `solve_drag`. |
-| **Emergence** | “Mechanism drag” and “assembly snap” are not single functions — they appear when markers + graph + LM + State + renderer align. |
+> CAD shapes remain unchanged. A body's current placement is stored separately in `State`, and the renderer applies the difference between the imported placement and the current placement.
 
----
+This separation makes dragging and constraint solving reversible and avoids repeatedly modifying expensive boundary-representation geometry.
 
-## 2. Package map (where code lives)
+## 2. System map
 
-```
+| System | Responsibility | Main input | Main output | Source |
+|---|---|---|---|---|
+| Application coordinator | Owns collections, connects Qt signals, starts workflows | User commands and worker results | Calls into every other system | [`MainWindow`](../main.py#L127) |
+| STEP import | Reads the file, discovers units, extracts solids | `.step` or `.stp` path | OCC shape, metres-per-model-unit scale, bodies | [`StepParser`](../core/step_parser.py#L14) |
+| Physical properties | Calculates volume, centre of mass, inertia and initial body frames | OCC body shapes and unit scale | SI-valued properties on each `RigidBody` | [`PhysicsCalculator`](../core/physics_calculator.py#L13) |
+| Geometry features | Describes selectable faces, edges and vertices | OCC body shape | Centres, normals, lengths, directions and coordinates | [`geometry_utils.py`](../core/geometry_utils.py) |
+| Domain model | Stores bodies, frames, joints, loads, motors and poses | Import and user-created definitions | Shared Python objects | [`data_structures.py`](../core/data_structures.py) |
+| Interaction | Converts mouse and panel actions into selections and drag targets | Screen events and OCC picks | Body/feature IDs and desired world positions | [`SelectableViewer3d`](../gui/viewer_3d.py#L22) |
+| Kinematics | Finds body poses that satisfy joints | Joints, markers, current `State`, optional drag target | Updated body poses and `SolveReport` | [`core/kinematics`](../core/kinematics) |
+| Visualization | Converts domain values into OCC interactive objects | Shapes, frames, loads and current poses | Displayed AIS objects and local transforms | [`visualization`](../visualization) |
+| Export | Serializes model data and triangulates body shapes | Bodies, joints, frames and unit scale | Assembly JSON and COM-centred OBJ files | [`AssemblyExporter`](../export/exporter.py#L25) |
+| Project persistence | Stores enough editing data to reopen a project | STEP path, frames and joints | `.mbdp` JSON | [`save_project`](../main.py#L2156), [`load_project`](../main.py#L2228) |
+
+## 3. Repository layout
+
+```text
 MBD-PreProcessor/
-├── main.py                      # MainWindow: load, drag, joints, solve UI
+├── main.py                         application entry point and coordinator
 ├── core/
-│   ├── data_structures.py       # RigidBody, Frame, Pose, State, Joint, Force, Torque
-│   ├── step_parser.py           # STEP → shapes / bodies
-│   ├── physics_calculator.py    # volume, COM, inertia, local frames
-│   ├── geometry_utils.py        # faces/edges/vertices extraction helpers
-│   └── kinematics/              # ★ position-level assembly solver
-│       ├── __init__.py          # KinematicSolver, capture_joint_markers
-│       ├── markers.py           # SE(3), exp/log SO(3), marker capture
-│       ├── graph.py             # JointGraph connected components
-│       ├── constraints.py       # Φ(q), analytic J per joint type
-│       └── solver.py            # LM loop, solve_assembly / solve_drag
-├── gui/                         # Viewer, tree, property panel, dialogs
-├── visualization/               # Body/joint/… AIS renderers
-├── export/                      # JSON export for downstream MBD
-└── tests/test_kinematics.py     # Headless solver tests
+│   ├── data_structures.py          domain objects and mutable pose state
+│   ├── step_parser.py              STEP loading, units and solid extraction
+│   ├── physics_calculator.py       volume, COM and inertia
+│   ├── geometry_utils.py           selected feature properties and frames
+│   └── kinematics/
+│       ├── markers.py              rigid-transform and rotation math
+│       ├── graph.py                connected body groups
+│       ├── constraints.py          joint residuals and Jacobians
+│       └── solver.py               damped least-squares solve
+├── gui/
+│   ├── viewer_3d.py                picking, camera controls and drag targets
+│   ├── body_tree_widget.py         model tree and delete/isolate actions
+│   ├── property_panel.py           selected-item properties
+│   └── *_dialog.py                 joint, force, torque and motor input
+├── visualization/
+│   └── *_renderer.py               domain-to-OpenCASCADE adapters
+├── export/
+│   └── exporter.py                 JSON and OBJ output
+└── tests/                           headless and OCC-backed regression tests
 ```
 
-**Separation rule:** `core/kinematics` imports only `numpy` + `core.data_structures`. It is headless-testable. GUI and OCC never enter the Newton loop.
+## 4. The data model and its coordinate systems
 
----
+The most important types are defined in [`core/data_structures.py`](../core/data_structures.py).
 
-## 3. Domain model from first principles
+### 4.1 Main objects
 
-### 3.1 RigidBody — entity with immutable geometry
+| Type | Meaning | Important fields |
+|---|---|---|
+| `RigidBody` | One solid extracted from the STEP assembly | `id`, `shape`, `volume`, `center_of_mass`, `inertia_tensor`, `local_frame`, `state` |
+| `Frame` | An origin and three oriented axes | `origin`, `rotation_matrix`, `name` |
+| `Pose` | A body's current six-degree-of-freedom placement | `origin`, `rotation_matrix` |
+| `State` | Mutable store for all live body poses | `body_poses[body_id]` |
+| `Joint` | Allowed relative motion between two bodies | body IDs, type, axis, world frame, two body-local markers |
+| `Force` | External force definition | body ID, application frame, magnitude, unit direction |
+| `Torque` | External moment definition | body ID, reference frame, magnitude, unit axis |
+| Motor fields on `Joint` | Intended joint actuation | motor type and target value |
 
-- `id`, `shape` (B-Rep), physical props, `local_frame` (COM frame at load).
-- `state: Optional[State]` — a **reference**, not owned pose storage.
-- `get_world_position()` / `get_world_rotation_matrix()` read from `State` when present.
+`RigidBody.shape` is an OpenCASCADE `TopoDS_Shape`. This is the high-detail CAD representation used for selection, display, property calculation and meshing. `RigidBody.state` is only a reference to the shared `State`; the live pose is not duplicated inside each body.
 
-### 3.2 Pose and State — the single source of mutable placement
+Although [`Assembly`](../core/data_structures.py#L189) defines a possible aggregate object, the current application does not use it as the runtime owner. `MainWindow` directly owns `bodies`, `joints`, `created_frames`, `forces`, `torques` and `assembly_state`. New features must therefore be wired into the coordinator's creation, deletion, clearing, display and serialization paths.
 
-```text
-State
-├── assembly_pose : Pose          # reserved root transform
-└── body_poses : { body_id → Pose }   # world origin + R (3×3)
-```
-
-**Invariant:** anything that “moves a body” in the interactive sense must eventually call `State.set_body_pose`. Renderers and property UI must *read* poses, not invent private copies as truth.
-
-### 3.3 Frame vs Pose vs marker
-
-| Type | Role |
-|------|------|
-| `Frame` | Named origin + R; used for UI frames, joint creation frame, markers |
-| `Pose` | Unnamed 6DOF placement in `State` |
-| **Marker** | A `Frame` stored **in body-local coordinates** on a joint (`marker1`, `marker2`) |
-
-### 3.4 Joint — kinematic relationship, not a visual only
-
-```text
-Joint
-├── name, joint_type, body1_id, body2_id   # body_id -1 = ground
-├── frame     # world frame at creation (UI / legacy display)
-├── axis      # "+X"…"−Z" motion axis in the joint frame
-├── marker1   # joint pose in body1 local coords  ★ solver
-├── marker2   # joint pose in body2 local coords  ★ solver
-└── motor fields (export / visualization; not used by position solver)
-```
-
-**First principle of joints:** a joint is defined once relative to each body. After that, when bodies move, the joint “moves with them” because world joint frames are reconstructed as:
-
-```text
-P_i = T_body_i ∘ M_i
-```
-
-where `T_body` comes from `State` and `M_i` is the captured marker.
-
-```mermaid
-flowchart LR
-    subgraph AtCreation
-        JW[Joint world frame J]
-        T1[Body1 pose T1]
-        T2[Body2 pose T2]
-        JW --> M1["M1 = T1⁻¹ · J"]
-        JW --> M2["M2 = T2⁻¹ · J"]
-    end
-    subgraph AtSolve
-        T1n[Current T1]
-        T2n[Current T2]
-        M1 --> P1["P1 = T1 · M1"]
-        M2 --> P2["P2 = T2 · M2"]
-        T1n --> P1
-        T2n --> P2
-        P1 --> Phi["Φ(P1, P2) → 0"]
-        P2 --> Phi
-    end
-```
-
-`capture_joint_markers(joint, body1_pose, body2_pose)` in `core/kinematics/__init__.py` performs the creation-time capture. `MainWindow` calls it when a joint is created and lazily if markers are missing before solve.
-
----
-
-## 4. The kinematic solver — deep dive
-
-### 4.1 Problem statement (math)
-
-Unknowns: for each **movable** body, a world pose. Parametrized inside the Newton loop by a 6-vector increment per body:
-
-```text
-δ = [ dpₓ, dpᵧ, dp_z,  δωₓ, δωᵧ, δω_z ]
-p ← p + dp
-R ← exp([δω]×) R     (left / world-frame rotation update)
-```
-
-Ground (`body_id == -1`) contributes **no unknowns**.
-
-Constraints: stack residuals Φ(q) from every joint. Solve the nonlinear least-squares problem
-
-```text
-min_q  ‖ W_joint · Φ(q) ‖²  (+ optional soft pin on dragged body)
-```
-
-with a **Levenberg–Marquardt** (damped Gauss–Newton) iteration using **analytic Jacobians**.
-
-This is the classical **full-Cartesian / absolute coordinate** assembly formulation (Haug-style position constraints; SolveSpace-like UX for drag pinning and group decomposition).
-
-### 4.2 Module responsibilities
-
-```mermaid
-graph LR
-    subgraph markers_py["markers.py"]
-        SO3[exp/log SO3, skew, project_to_so3]
-        SE3[compose, invert, pose matrix]
-        Cap[capture_marker / marker_world]
-        Inc[apply_increment]
-    end
-    subgraph graph_py["graph.py"]
-        UF[Union-find components]
-        Anch[is_anchored via ground]
-    end
-    subgraph constraints_py["constraints.py"]
-        JC[JointConstraint.residual]
-        JJ[JointConstraint.jacobian]
-        CC[CONSTRAINT_COUNT]
-    end
-    subgraph solver_py["solver.py"]
-        Build[_build stack Φ and J]
-        LM[_solve_lm]
-        SA[solve_assembly]
-        SD[solve_drag]
-        AN[_analyze rank / DOF / redundant]
-    end
-
-    Cap --> JC
-    Inc --> LM
-    JC --> Build
-    JJ --> Build
-    UF --> SA
-    UF --> SD
-    Build --> LM
-    LM --> SA
-    LM --> SD
-    Build --> AN
-```
-
-| File | Responsibility |
-|------|----------------|
-| `markers.py` | Lie-group math + body-local markers |
-| `graph.py` | Which bodies must move together; solve only needed component |
-| `constraints.py` | Per-joint Φ and ∂Φ/∂δ |
-| `solver.py` | System assembly, LM, public API, redundancy/DOF report |
-
-### 4.3 Constraint equations by joint type
-
-World frames of the two markers: origins `o1, o2`, rotations `R1, R2`. Motion axes `a1 = R1 a_local`, `a2 = R2 a_local` where `a_local` comes from `Joint.axis`.
-
-| Joint | Residual stack (implementation) | Nominal DOF removed | Notes |
-|-------|----------------------------------|---------------------|-------|
-| **FIXED** | `(o1−o2)` (3) + `log(R2 R1ᵀ)` (3) | 6 | Full weld |
-| **REVOLUTE** | `(o1−o2)` (3) + `a1×a2` (3) | 5 | Cross product rank 2; LS absorbs deficiency |
-| **PRISMATIC** | `a1×(o2−o1)` (3) + orientation lock (3) | 5 | Slide along axis; no relative rotation |
-| **CYLINDRICAL** | `a1×(o2−o1)` (3) + `a1×a2` (3) | 4 | Slide + spin about same axis |
-| **SPHERICAL** | `(o1−o2)` (3) | 3 | Ball joint |
-
-`CONSTRAINT_COUNT` stores the **number of residual rows** written (often 6 with rank-deficient blocks). True mobility uses **Jacobian SVD rank**, not row count.
-
-```mermaid
-flowchart TB
-    subgraph Residuals["Φ blocks"]
-        Pos["Point coincidence<br/>o1 − o2"]
-        Line["Point on axis<br/>a1 × (o2 − o1)"]
-        Ax["Axis parallel<br/>a1 × a2"]
-        Rot["Orientation lock<br/>log SO3"]
-    end
-
-    FIXED --> Pos
-    FIXED --> Rot
-    REVOLUTE --> Pos
-    REVOLUTE --> Ax
-    PRISMATIC --> Line
-    PRISMATIC --> Rot
-    CYLINDRICAL --> Line
-    CYLINDRICAL --> Ax
-    SPHERICAL --> Pos
-```
-
-### 4.4 Analytic Jacobians (why they matter)
-
-For left increments on SO(3)/SE(3):
-
-- Point attached to a body:  
-  `∂p_world/∂δ = [ I | −[p − body_origin]× ]`
-- Direction attached to a body:  
-  `∂d_world/∂δ = [ 0 | −[d]× ]`
-- Orientation residual `log(R2 R1ᵀ)`:  
-  `∂/∂ω1 ≈ −I`, `∂/∂ω2 ≈ +I` (consistent with left increments)
-
-Cross-product residuals differentiate via product rule and skew identities (implemented in `JointConstraint.jacobian`).
-
-**Systems note:** analytic J makes each drag tick cheap enough for interactive rates and keeps finite-difference noise out of the balancing loop. `tests/test_kinematics.py` checks J against central differences.
-
-### 4.5 Group decomposition (JointGraph)
-
-Bodies = nodes, joints = edges, ground = node `-1`.
-
-```mermaid
-graph TD
-    G((Ground -1)) --- R1[Revolute]
-    R1 --- B1[Body 1 crank]
-    B1 --- R2[Revolute]
-    R2 --- B2[Body 2 coupler]
-    B2 --- R3[Revolute]
-    R3 --- B3[Body 3 rocker]
-    B3 --- R4[Revolute]
-    R4 --- G
-
-    B9[Body 9 free] -. no joints .- B9
-    B7[Body 7] --- F[Fixed]
-    F --- B8[Body 8]
-```
-
-- `solve_drag(body_id, …)` solves **only** `component_of(body_id)`.
-- `solve_assembly()` solves **each** component with joints independently.
-- Unrelated free bodies are untouched — critical for large assemblies and for UX predictability.
-
-This is the SolveSpace-inspired “group” idea at assembly scale.
-
-### 4.6 Levenberg–Marquardt loop (`_solve_lm`)
-
-```mermaid
-flowchart TD
-    A[Build movable list + stack constraints] --> B[r = W·Φ optional pin]
-    B --> C[J = W·∂Φ/∂δ]
-    C --> D{‖Φ‖_∞ < tol and step tiny?}
-    D -->|yes| Z[Converged]
-    D -->|no| E["Solve (JᵀJ + λ diag) δ = −Jᵀr"]
-    E --> F[Trial apply_increment on all movable]
-    F --> G{‖r_new‖ improved?}
-    G -->|yes| H[Accept; λ ← λ/2]
-    G -->|no| I[Revert poses; λ ← 4λ]
-    H --> B
-    I --> B
-```
-
-Design choices encoded in code:
-
-| Choice | Implementation | Why |
-|--------|----------------|-----|
-| Hard joints, soft pin | `joint_weight≈1e3` on Φ; `pin_weight` on drag target | Mouse is intent; joints win if conflict |
-| Pin position-only on drag | `pin_orientation=False` default in `solve_drag` | Matches translation mouse drag |
-| Damping on `diag(JᵀJ)` | LM diagonal scaling | Handles rank loss / redundancy |
-| SO(3) projection | `project_to_so3` on write | Kills numerical drift |
-| Component-local solve | `JointGraph` | Performance + isolation |
-
-### 4.7 Soft pin = how drag becomes mechanism motion
-
-Without solver:
-
-```text
-mouse → set_body_pose(dragged only) → one AIS moves
-```
-
-With solver:
-
-```text
-mouse target t
-→ min ‖W Φ(q)‖² + w_pin ‖p_drag − t‖²
-→ all movable bodies in the component update in State
-→ all their AIS update
-```
-
-If the target is unreachable (e.g. pin outside a pendulum circle), joints stay nearly satisfied and the body moves to the **feasible** pose closest (in the weighted LS sense) to the pin — classic soft constraint trade-off.
-
-```mermaid
-sequenceDiagram
-    participant Mouse
-    participant Timer as Drag timer
-    participant MW as MainWindow
-    participant KS as KinematicSolver
-    participant St as State
-    participant BR as BodyRenderer
-
-    Mouse->>MW: pending target position
-    Timer->>MW: _apply_pending_drag_update
-    alt body has joints
-        MW->>KS: solve_drag(id, target, pin_orientation=False)
-        KS->>KS: component joints + LM
-        KS->>St: set_body_pose for moved bodies
-        KS-->>MW: SolveReport.moved_bodies
-        loop each moved body
-            MW->>BR: update_body_transform
-            MW->>MW: _sync_highlight_transforms
-        end
-    else free body
-        MW->>St: set_body_pose(dragged only)
-        MW->>BR: update_body_transform
-    end
-    MW->>MW: UpdateCurrentViewer + Repaint
-```
-
-### 4.8 Assembly snap (`solve_assembly` / Ctrl+K)
-
-One-shot solve with **no pin**: pure constraint satisfaction from the current poses as initial guess. Used to repair imports / user mess, and as a trust-building “make it valid” command.
-
-Report (`SolveReport`):
-
-- `converged`, `iterations`, residual norms  
-- `per_joint_residual`  
-- `moved_bodies`  
-- `redundant_joints` (leave-one-joint-out rank test when `n_eq > rank`)  
-- `dof = n_unknown − rank(J)`  
-
-UI: Assembly menu → **Solve Assembly** (`Ctrl+K`) → dialog + status bar summary.
-
-### 4.9 DOF and redundancy (analysis subsystem)
-
-After solve (or on demand in `solve_assembly(analyze=True)`):
-
-1. Assemble dense J for movable bodies and joints.  
-2. `rank = #{ singular values > threshold }`.  
-3. `dof = max(0, 6·n_movable − rank)`.  
-4. If overdetermined in rows vs rank, test each joint’s row block: if removing it does not drop rank, flag joint name as **redundant**.
-
-```mermaid
-flowchart LR
-    J[Jacobian J] --> SVD[SVD σ_i]
-    SVD --> Rank[rank]
-    N[6 × n_movable] --> DOF["DOF = N − rank"]
-    Rank --> DOF
-    J --> Leave[Leave-one-joint rank test]
-    Leave --> Red[redundant_joints list]
-```
-
-Example mental models:
-
-- Pendulum (ground–revolute–body): ~1 DOF.  
-- Four-bar (ground + 3 bodies, 4 revolutes): 1 DOF.  
-- Two coincident FIXED joints body–ground: 0 DOF, redundant joint reported.
-
-### 4.10 Public API surface
+The pose write path is deliberately small:
 
 ```python
-from core.kinematics import KinematicSolver, capture_joint_markers, SolveReport
+class State:
+    def __init__(self):
+        self.assembly_pose: Pose = Pose()
+        self.body_poses: Dict[int, Pose] = {}
 
-capture_joint_markers(joint, (o1, R1), (o2, R2))
-
-solver = KinematicSolver(
-    bodies, joints, state,
-    ground_id=-1,
-    ground_pose=(o_g, R_g),
-    locked_body_ids=None,  # extra immovable bodies
-)
-
-report = solver.solve_assembly(max_iters=50, tol=1e-9, analyze=True)
-report = solver.solve_drag(body_id, target_origin, target_R=None,
-                           pin_weight=100.0, max_iters=30, tol=1e-8,
-                           pin_orientation=False)
+    def set_body_pose(self, body_id: int, origin: np.ndarray,
+                      rotation_matrix: np.ndarray):
+        self.body_poses[body_id] = Pose(origin, rotation_matrix)
 ```
 
-`MainWindow._make_kinematic_solver()` ensures markers exist, then constructs the solver over live `self.bodies`, `self.joints`, `self.assembly_state`.
+See [`State`](../core/data_structures.py#L317) and [`RigidBody.get_world_position`](../core/data_structures.py#L404).
 
----
+### 4.2 Coordinate spaces
 
-## 5. End-to-end runtime flows
+The code works in several coordinate spaces. Mixing them is a common source of errors.
 
-### 5.1 Load STEP (geometry → bodies → State)
+| Space | Unit | Used by |
+|---|---|---|
+| Imported CAD/model space | Unit declared by the STEP file | OCC shapes and topology |
+| Domain world space | metres | COM, `Frame.origin`, `Pose.origin`, solver positions |
+| Orientation space | dimensionless 3×3 rotation matrix | Frames, poses and joint markers |
+| Body marker space | metres relative to the body's pose | `Joint.marker1` and `Joint.marker2` |
+| Viewer transform space | original model units | OCC `gp_Trsf` translations |
+| OBJ body-local space | metres, centred on COM | Exported mesh vertices |
+
+`unit_scale` means **metres per model unit**. A millimetre STEP file therefore has `unit_scale = 0.001`. Domain positions are multiplied by this scale on import. Renderer translations are divided by it when converted back to OCC model units.
+
+`State.assembly_pose` exists as a potential root transform but is not used by the current interaction, solver or renderer flows; live placement is carried by the per-body entries.
+
+### 4.3 Geometry, initial frame and live pose
+
+These values look similar but have different jobs:
+
+- The OCC `shape` contains the imported geometry at its original placement.
+- `center_of_mass` is calculated from that imported geometry and stored in metres.
+- `local_frame` is initialized at the COM with world-aligned axes.
+- The first `Pose` in `State` is copied from `local_frame`.
+- Later drag or solve operations update `State`.
+- `BodyRenderer` remembers the first pose and applies only the pose difference to the unchanged shape.
+
+The current code also copies solved or dragged poses back into `body.local_frame` for UI convenience. Code that needs the live body placement should nevertheless prefer `State`, because that is the solver and renderer's shared source.
+
+## 5. STEP import system
+
+### 5.1 Loading is split across two threads
+
+`MainWindow.load_step_file()` clears the old model and starts [`StepLoadWorker`](../main.py#L83). The worker performs operations that may be slow:
+
+```python
+shape, unit_scale = StepParser.load_step_file(self.filepath)
+bodies = StepParser.extract_bodies_from_compound(shape)
+PhysicsCalculator.calculate_volumes_for_bodies(bodies, unit_scale)
+PhysicsCalculator.calculate_centers_of_mass_for_bodies(bodies, unit_scale)
+PhysicsCalculator.calculate_inertia_tensors_for_bodies(bodies, unit_scale)
+PhysicsCalculator.initialize_local_frames(bodies)
+self.result.emit(bodies, unit_scale)
+```
+
+This code is in [`StepLoadWorker.run`](../main.py#L95). It does not create or modify viewer objects. The result signal returns to the Qt main thread, where [`on_load_result`](../main.py#L527) creates `State`, attaches it to each body and displays the shapes.
 
 ```mermaid
 sequenceDiagram
-    participant U as User
-    participant MW as MainWindow
+    participant UI as Qt main thread
     participant W as StepLoadWorker
     participant P as StepParser
     participant Ph as PhysicsCalculator
     participant S as State
-    participant BR as BodyRenderer
+    participant V as Viewer/renderers
 
-    U->>MW: Open STEP
-    MW->>MW: _clear_ui_for_new_load
-    MW->>W: start thread
-    W->>P: load_step_file / extract_bodies
-    W->>Ph: volume, COM, inertia, local_frames
-    W-->>MW: bodies, unit_scale
-    MW->>S: State(); set_body_pose each body
-    MW->>BR: display_bodies (record base poses)
-    MW->>MW: extract sub-shapes, enable UI
+    UI->>W: STEP path
+    W->>P: read file and units
+    P-->>W: OCC shape, unit_scale
+    W->>P: extract solids
+    P-->>W: RigidBody list
+    W->>Ph: volume, COM, inertia, local frames
+    W-->>UI: bodies, unit_scale
+    UI->>S: create one pose per body
+    UI->>V: display shapes and map IDs
+    UI->>UI: extract selectable feature properties
 ```
 
-**Why a worker thread?** Parsing and mass properties are slow; they sit outside the interactive feedback loop so the UI stock (responsiveness) is not drained.
+### 5.2 Unit discovery and solid extraction
 
-After load, poses match imported geometry (identity delta on AIS). Joints do not exist yet → free dragging is pure State mutation.
+[`StepParser.load_step_file`](../core/step_parser.py#L18) asks the STEP reader for the declared length unit and maps metre, millimetre, centimetre, inch and foot names to SI scale factors. Unknown declarations currently fall back to `1.0`.
 
-### 5.2 Create joint (definition freeze)
+[`extract_bodies_from_compound`](../core/step_parser.py#L113) walks every `TopAbs_SOLID` and creates one `RigidBody` per solid, with sequential IDs starting at zero. If the imported shape contains no discoverable solid but is non-null, the complete shape becomes `Body_0`.
 
-1. Dialog picks type, two bodies (or ground), a world `Frame`, axis.  
-2. `Joint(...)` constructed.  
-3. `capture_joint_markers` freezes `marker1`/`marker2` from **current** body poses.  
-4. Tree + `JointRenderer` update.
+This means a "body" currently follows STEP solid topology. Product names, assembly hierarchy and CAD occurrence metadata are not preserved.
 
-**Systems warning:** markers capture the relative geometry **at creation time**. If bodies were already misaligned relative to the intended mate, the joint “defines” that misalignment. Snap (`solve_assembly`) then tries to satisfy *that* definition — it does not re-infer CAD mates.
+### 5.3 Main-thread completion
 
-### 5.3 Free drag vs constrained drag
+After the worker returns, the coordinator:
 
-```mermaid
-flowchart TD
-    A[Left-drag body in Body mode] --> B[Queue target world position]
-    B --> C[Timer tick]
-    C --> D{Any joint on this body?}
-    D -->|no| E[State.set_body_pose dragged only]
-    D -->|yes| F[KinematicSolver.solve_drag soft pin]
-    F --> G[State updated for whole component]
-    E --> H[update_body_transform + highlight sync]
-    G --> H
-    H --> I[Repaint]
+1. stores the unit scale;
+2. initializes each body pose from its COM frame;
+3. displays each OCC shape;
+4. extracts all face, edge and vertex properties;
+5. creates body-ID-to-AIS mappings used by picking;
+6. measures the assembly bounding box to size frame axes and load symbols.
+
+See [`on_load_result`](../main.py#L527) and [`_finish_step_load`](../main.py#L577).
+
+## 6. Geometry and reference-frame system
+
+Faces, edges and vertices are not separate domain entities. They are indexed features of a body shape and are described by:
+
+- [`FaceProperties`](../core/geometry_utils.py#L21): surface area, area centre and normal;
+- [`EdgeProperties`](../core/geometry_utils.py#L155): true length, feature centre and direction;
+- [`VertexProperties`](../core/geometry_utils.py#L115): point coordinates.
+
+All reported locations and lengths are converted to metres.
+
+### 6.1 How frames are created
+
+A selected feature can become a named `Frame`:
+
+| Feature | Frame origin | Frame Z axis | Frame X/Y axes |
+|---|---|---|---|
+| Face | Surface area centre | Face normal | Global X projected into the face plane; Y completes a right-handed basis |
+| Circle or ellipse edge | Geometric centre | Curve plane normal | Same projection rule |
+| Line edge | Length centre | Line direction | Same projection rule |
+| Other edge | Length centroid | Chord or tangent fallback | Same projection rule |
+| Vertex | Vertex point | Global Z | Identity/world-aligned axes |
+
+For a face, the basis construction is:
+
+```python
+z_axis = face_props.normal / np.linalg.norm(face_props.normal)
+target_x = np.array([1.0, 0.0, 0.0])
+x_axis = target_x - np.dot(target_x, z_axis) * z_axis
+x_axis = x_axis / np.linalg.norm(x_axis)
+y_axis = np.cross(z_axis, x_axis)
+rotation = np.column_stack((x_axis, y_axis, z_axis))
 ```
 
-Throttling (pixel threshold, QTimer, epsilon on applied position) is a **balancing loop** against event spam — it keeps the LM + OCC path inside a stable frame budget.
+The implementation also changes the reference axis when Z is almost parallel to global X. See [`frame_from_face`](../core/geometry_utils.py#L453) and [`frame_from_edge`](../core/geometry_utils.py#L499).
 
-### 5.4 Rendering contract (geometry vs pose)
+### 6.2 Body-attached frame flow
 
-`BodyRenderer` records `_base_poses` at first display. On update:
+Feature frames are stored in the imported body's geometry space, with metre-valued origins. `MainWindow.frame_to_body_map` records which body owns each created frame. During rendering, the frame receives the same OCC local transformation as its body.
 
 ```text
-desired = State pose
-base    = pose at display time
-Δ = desired ∘ base⁻¹   (as gp_Trsf)
-AIS.SetLocalTransformation(Δ)
+selected (body_id, feature_index)
+    -> cached feature properties
+    -> GeometryUtils.frame_from_*
+    -> created_frames[frame_name]
+    -> frame_to_body_map[frame_name] = body_id
+    -> FrameRenderer with the body's AIS local transform
 ```
 
-**Invariant:** original `TopoDS_Shape` never moves. Highlights copy the same local `trsf` via `_sync_highlight_transforms`.
+The creation paths are [`on_create_frame_from_face`](../main.py#L1095), [`on_create_frame_from_edge`](../main.py#L1135) and [`on_create_frame_from_vertex`](../main.py#L1168). Synchronization after movement happens in [`_sync_body_attached_frames`](../main.py#L1211).
 
-### 5.5 Selection and camera (input grammar)
+These frames are the bridge between CAD features and model definitions: joint locations, force application points and torque reference points are selected from the available frames.
 
-| Input | Meaning |
-|-------|---------|
-| Left (Body mode) | Select + translate drag (possibly constrained) |
-| Left (Face/Edge/Vertex) | Sub-shape pick |
-| Right drag | Camera orbit |
+## 7. Joint and marker system
+
+The implemented joint types are:
+
+| Joint type | Allowed relative motion | Ideal mobility between two bodies |
+|---|---|---:|
+| `FIXED` | None | 0 |
+| `REVOLUTE` | Rotation about one axis | 1 |
+| `PRISMATIC` | Translation along one axis | 1 |
+| `CYLINDRICAL` | Translation and rotation along/about one axis | 2 |
+| `SPHERICAL` | Rotation about a common point | 3 |
+
+The enum is defined in [`JointType`](../core/data_structures.py#L15). Universal and planar joints are not implemented in the current domain model or solver.
+
+### 7.1 Why a joint has two markers
+
+The user chooses one world-space joint frame, but a constraint must continue to move with both bodies. At joint creation, the chosen frame \(J\) is converted into one local marker for each body:
+
+\[
+M_i = T_i^{-1}J
+\]
+
+where \(T_i\) is body \(i\)'s current world pose. During a solve, the marker is reconstructed in world space:
+
+\[
+P_i = T_iM_i
+\]
+
+The constraint compares \(P_1\) and \(P_2\), not the original display frame.
+
+```python
+def capture_joint_markers(joint, body1_pose, body2_pose):
+    joint.marker1 = markers.capture_marker(
+        joint.frame, body1_pose[0], body1_pose[1])
+    joint.marker2 = markers.capture_marker(
+        joint.frame, body2_pose[0], body2_pose[1])
+    return joint
+```
+
+See [`capture_joint_markers`](../core/kinematics/__init__.py#L20), [`capture_marker`](../core/kinematics/markers.py#L162) and the creation call in [`MainWindow.create_joint`](../main.py#L1559).
+
+Ground is represented by body ID `-1` and is assigned the world frame. It has a pose but no solver unknowns.
+
+### 7.2 Joint creation data flow
+
+```mermaid
+sequenceDiagram
+    participant U as User
+    participant D as Joint dialog
+    participant M as MainWindow
+    participant S as State
+    participant K as Marker math
+    participant R as Joint renderer
+
+    U->>D: type, bodies, frame, axis
+    D-->>M: Joint input values
+    M->>S: read both current body poses
+    M->>K: capture local marker for each body
+    K-->>M: marker1, marker2
+    M->>M: joints[name] = joint
+    M->>R: draw the selected joint frame
+```
+
+Marker capture freezes the relationship that exists at creation time. The solver does not infer CAD mates or search for matching surfaces later.
+
+## 8. Kinematic solver
+
+The solver changes positions and orientations so that joint equations are as close to zero as possible. It is a **position-level** solver: mass, inertia, forces, torques, motors and time are not part of its equations.
+
+The package depends on NumPy and the domain structures but not Qt or OpenCASCADE, which allows the main solver tests to run headlessly.
+
+### 8.1 Solver modules
+
+| Module | Role |
+|---|---|
+| [`markers.py`](../core/kinematics/markers.py) | Rigid pose composition/inversion, marker transforms, rotation exponential/logarithm |
+| [`graph.py`](../core/kinematics/graph.py) | Splits the joint network into connected body groups |
+| [`constraints.py`](../core/kinematics/constraints.py) | Calculates each joint's error vector and analytic derivative |
+| [`solver.py`](../core/kinematics/solver.py) | Builds the global system, iterates, updates `State`, reports convergence and mobility |
+
+### 8.2 Pose update mathematics
+
+Each movable body contributes six temporary unknowns per iteration:
+
+\[
+\delta =
+\begin{bmatrix}
+\Delta p_x & \Delta p_y & \Delta p_z &
+\Delta\omega_x & \Delta\omega_y & \Delta\omega_z
+\end{bmatrix}^T
+\]
+
+Translation is added in the world frame. Rotation is updated with the exponential map:
+
+\[
+p_{\text{new}} = p + \Delta p
+\]
+
+\[
+R_{\text{new}} = \exp([\Delta\omega]_\times)R
+\]
+
+where \([v]_\times\) is the skew-symmetric matrix that performs a cross product. [`exp_so3`](../core/kinematics/markers.py#L68) uses Rodrigues' formula and a small-angle approximation. [`project_to_so3`](../core/kinematics/markers.py#L114) uses singular-value decomposition to remove numerical drift before a rotation is written back to `State`.
+
+### 8.3 Constraint equations
+
+Let \(o_1,o_2\) be the two marker origins in world space, \(R_1,R_2\) their rotations, and \(a_1,a_2\) the chosen joint axis transformed by each marker.
+
+| Joint | Error vector driven toward zero | Physical meaning |
+|---|---|---|
+| Fixed | \([o_1-o_2,\ \log(R_2R_1^T)]\) | Same point and same orientation |
+| Revolute | \([o_1-o_2,\ a_1\times a_2]\) | Same point and parallel axes |
+| Prismatic | \([a_1\times(o_2-o_1),\ \log(R_2R_1^T)]\) | Same line and locked relative orientation |
+| Cylindrical | \([a_1\times(o_2-o_1),\ a_1\times a_2]\) | Same line and parallel axes |
+| Spherical | \(o_1-o_2\) | Same point |
+
+The direct implementation is in [`JointConstraint.residual`](../core/kinematics/constraints.py#L167):
+
+```python
+if jt == JointType.REVOLUTE:
+    r_pos = o1 - o2
+    r_ax = np.cross(a1, a2)
+    return np.concatenate([r_pos, r_ax])
+
+if jt == JointType.PRISMATIC:
+    r_line = np.cross(a1, o2 - o1)
+    r_rot = M.relative_rotation_vector(R1, R2)
+    return np.concatenate([r_line, r_rot])
+```
+
+Some three-component cross-product errors have only two independent components. Therefore the number of rows is not the true number of restrictions. The solver uses the numerical rank of the full derivative matrix to estimate mobility.
+
+### 8.4 Analytic derivatives
+
+The solver calculates how each error changes for a small body movement. Two building blocks are:
+
+\[
+\frac{\partial p_\text{world}}{\partial \delta}
+=
+\begin{bmatrix}
+I & -[p_\text{world}-p_\text{body}]_\times
+\end{bmatrix}
+\]
+
+\[
+\frac{\partial d_\text{world}}{\partial \delta}
+=
+\begin{bmatrix}
+0 & -[d_\text{world}]_\times
+\end{bmatrix}
+\]
+
+These formulas are implemented in [`_point_jac`](../core/kinematics/constraints.py#L116) and [`_dir_jac`](../core/kinematics/constraints.py#L129). The remainder of [`JointConstraint.jacobian`](../core/kinematics/constraints.py#L202) applies the product rule to the joint equations.
+
+Analytic derivatives avoid repeated extra evaluations during interactive dragging. [`test_jacobian_finite_difference`](../tests/test_kinematics.py#L202) checks them against central finite differences.
+
+### 8.5 Connected components
+
+[`JointGraph`](../core/kinematics/graph.py#L22) treats bodies as nodes and joints as edges. It uses union-find to create independent connected components.
+
+- `solve_assembly()` solves every component containing joints.
+- `solve_drag(body_id, ...)` solves only the component containing the dragged body.
+- Unconnected bodies are moved directly and unrelated mechanisms are left unchanged.
+- A component containing body `-1` is connected to ground.
+
+This graph step makes behavior easier to predict and keeps small edits from unnecessarily solving the entire model.
+
+### 8.6 Damped least-squares iteration
+
+All joint errors are stacked into \(r\), and their derivatives are stacked into \(J\). The code solves a damped normal equation:
+
+\[
+\left(J^TJ+\lambda\,\mathrm{diag}(J^TJ)\right)\delta=-J^Tr
+\]
+
+```python
+JTJ = J.T @ J
+g = J.T @ r
+diag = np.diag(JTJ).copy()
+delta = np.linalg.solve(
+    JTJ + lam * np.diag(diag),
+    -g,
+)
+```
+
+See [`KinematicSolver._solve_lm`](../core/kinematics/solver.py#L122). A successful trial halves the damping value; a worse trial restores the previous poses and increases damping. The final poses are written through `State.set_body_pose`.
+
+Joint errors are multiplied by `1000` by default. A drag target is added with the square root of its `pin_weight`. This makes the joints effectively hard and the mouse position soft: if the cursor asks for an impossible position, the mechanism stays close to its valid motion and approaches the nearest reachable position.
+
+### 8.7 Assembly solve and drag solve
+
+`MainWindow.solve_assembly()` calls:
+
+```python
+report = solver.solve_assembly(
+    max_iters=80,
+    tol=1e-9,
+    analyze=True,
+)
+```
+
+The command is available as **Assembly → Solve Assembly** or `Ctrl+K`; see [`solve_assembly`](../main.py#L1657).
+
+During a drag, the 16 ms UI timer calls:
+
+```python
+rep = solver.solve_drag(
+    body_id,
+    new_pos,
+    current_rot,
+    pin_weight=1.0,
+    max_iters=12,
+    tol=1e-6,
+    pin_orientation=False,
+)
+```
+
+Only position is pinned because the current mouse gesture translates in the camera plane. See [`_apply_pending_drag_update`](../main.py#L724).
+
+### 8.8 Solver report
+
+[`SolveReport`](../core/kinematics/solver.py#L37) contains:
+
+- convergence status and iteration count;
+- total and maximum joint error;
+- one error norm per joint;
+- IDs of bodies touched by the solve;
+- estimated remaining degrees of freedom;
+- potentially redundant joints.
+
+The degree-of-freedom estimate is:
+
+\[
+\mathrm{DOF}=6n_\text{movable}-\mathrm{rank}(J)
+\]
+
+Redundancy is estimated by removing one joint's rows at a time. If removal does not lower the matrix rank, that joint is reported as redundant. This is a numerical diagnostic, not a symbolic proof.
+
+## 9. Interaction and visualization
+
+### 9.1 Input flow
+
+[`SelectableViewer3d`](../gui/viewer_3d.py#L22) owns the low-level viewer interaction:
+
+| Input | Result |
+|---|---|
+| Click in Body mode | Select a whole body |
+| Click in Face/Edge/Vertex mode | Return the selected sub-shape index |
+| Left drag on the already selected body | Translate that body or its connected mechanism |
+| Left drag elsewhere | Pan |
+| Right drag | Orbit |
 | Middle drag | Pan |
 | Wheel | Zoom |
-| View menu snaps | Camera only — never State |
-| Ctrl+K | `solve_assembly` |
 
-Clear separation: **model manipulation** vs **view manipulation** vs **constraint repair**.
+OCC selection returns an interactive shape or sub-shape owner. Viewer mappings translate that object back to a `body_id`, and topology traversal translates a selected sub-shape into a stable per-load index. See [`_select_at_position`](../gui/viewer_3d.py#L311).
 
----
+### 9.2 Mouse pixels to a desired body position
 
-## 6. Causal loop diagram (how behavior emerges)
+The drag code builds camera-plane right and up vectors from the current view direction. Pixel motion is scaled using the current view size:
 
-```mermaid
-flowchart TB
-    subgraph Reinforcing_R1["R1 Interactive authority"]
-        Mouse[Mouse intent] --> Pin[Soft pin target]
-        Pin --> Solve[LM solver]
-        Solve --> Poses[State poses]
-        Poses --> Pix[Pixels via AIS]
-        Pix --> Mouse
-    end
+\[
+\Delta p \approx s_\text{pixel}
+\left(\Delta x\,\hat{r}-\Delta y\,\hat{u}\right)
+\]
 
-    subgraph Balancing_B1["B1 Joint validity"]
-        Poses --> Phi[Residuals Φ]
-        Phi --> Solve
-    end
-
-    subgraph Balancing_B2["B2 Responsiveness"]
-        Mouse --> Queue[Pending drag]
-        Queue --> Timer[Throttle timer]
-        Timer --> Solve
-        Timer -.->|limits rate| Pix
-    end
-
-    subgraph Balancing_B3["B3 Rank / redundancy awareness"]
-        Solve --> Report[SolveReport DOF/redundant]
-        Report --> UserTrust[User trust / next edit]
-        UserTrust --> Mouse
-    end
-```
-
-| Loop | Type | If broken |
-|------|------|-----------|
-| R1 | Reinforcing | App feels dead; no mechanism joy |
-| B1 | Balancing | Bodies fly apart; joints become stickers |
-| B2 | Balancing | UI freezes or jitters |
-| B3 | Balancing | User cannot debug overconstrained assemblies |
-
-**Emergence:** “Dragging a four-bar and watching it articulate” requires R1+B1+B2 together with correct markers and component graph. Remove markers → joints stay world-fixed decorations. Remove graph scoping → unrelated parts thrash. Remove soft pin → dragged body ignores the mouse or hard-locks.
-
----
-
-## 7. Component roles (systems table)
-
-| Component | System role | Reads | Writes |
-|-----------|-------------|-------|--------|
-| `State` | Stock of extrinsic poses; **highest leverage** | Everyone downstream | Drag, solver, (future undo) |
-| `RigidBody` | Geometry + identity + physics props | `State` for world pose | Load/physics only for intrinsic fields |
-| `Joint` + markers | Constraint definitions | — | Creation-time marker freeze |
-| `JointGraph` | Topology / decomposition | Joint endpoints | — (ephemeral) |
-| `JointConstraint` | Φ and J | poses via callback | — |
-| `KinematicSolver` | Constraint satisfaction engine | bodies, joints, State | `State` poses |
-| `SelectableViewer3d` | Input boundary | OCC pick | signals / camera |
-| `BodyRenderer` | Pose→pixels adapter | `State`, base poses | AIS local trsf |
-| `MainWindow` | Mediator / policy | all | wires loops, owns collections |
-| `StepLoadWorker` | Heavy compute boundary | file | result signal |
-| OCC AIS/V3d | Display platform | transforms, selection | framebuffer |
-
----
-
-## 8. Boundaries and non-negotiable contracts
-
-1. **Geometry boundary** — no solver or drag path mutates `TopoDS_Shape`.  
-2. **Pose boundary** — solver and drag write only through `State.set_body_pose`.  
-3. **Marker boundary** — joint meaning is markers + type + axis; world `Joint.frame` is creation snapshot / display aid.  
-4. **Threading boundary** — LM runs on the UI thread today (short max_iters on drag). Heavy STEP work is off-thread. Do not touch AIS from workers.  
-5. **Headless boundary** — `core/kinematics` must remain importable without OCC/Qt (see `tests/test_kinematics.py`).  
-6. **Ground boundary** — `body_id == -1` is locked; anchors components that include it.
-
----
-
-## 9. Worked examples (mental simulation)
-
-### 9.1 Simple pendulum
-
-- Bodies: ground + body 1.  
-- Joint: REVOLUTE at origin, axis +Z.  
-- Markers: M1 on ground at origin; M2 on body at the hinge point in body coordinates.  
-- Drag body tip in XY: pin pulls COM; Φ forces hinge coincidence + axis parallel → body swings on a circle.  
-- Expected mobility ≈ 1.
-
-### 9.2 Prismatic slider
-
-- Residuals kill off-axis translation and relative rotation; free coordinate is slide along axis.  
-- Drag sideways: solver returns body to the rail while chasing the pin along the allowed line.
-
-### 9.3 Four-bar (closed loop)
-
-- Full Cartesian formulation handles the loop without cutting joints manually.  
-- After perturbation, `solve_assembly` closes the loop; `dof` should be 1 when modeled like the unit test.  
-- Dragging the coupler moves crank and rocker together via one LM system on the component.
-
-### 9.4 Overconstrained double weld
-
-- Two FIXED joints body–ground → rank deficient extra rows → `redundant_joints` non-empty, `dof == 0`, still LS-solvable if consistent.
-
----
-
-## 10. Testing strategy for the solver
-
-`tests/test_kinematics.py` (run: `python tests/test_kinematics.py`):
-
-| Test | Proves |
-|------|--------|
-| `test_jacobian_finite_difference` | Analytic J trust for all joint types |
-| `test_pendulum` / `test_slider` | Open-chain constraint satisfaction |
-| `test_four_bar` | Closed loop + DOF≈1 |
-| `test_over_constrained` | Redundancy reporting |
-| `test_drag_pin` | Soft pin vs revolute feasibility |
-
-These are the **regression fence** around the constraint layer. GUI tests are separate and slower; keep kinematics pure.
-
----
-
-## 11. Leverage points (ordered)
-
-1. **Marker capture quality** — wrong markers ⇒ permanently wrong mechanism.  
-2. **`State` as sole pose bus** — keeps renderer, export, solver coherent.  
-3. **Drag hook policy** (`solve_drag` vs free set) — defines product feel.  
-4. **`pin_weight` / `joint_weight` / `max_iters` / `tol`** — snappy vs rubbery vs jitter.  
-5. **Graph component isolation** — scalability and predictability.  
-6. **Jacobian rank analysis** — teachability of “why won’t this assemble”.  
-7. **Future:** locked bodies, hierarchical assemblies, undo stack on State, joint renderer drawing live `T·M` frames.
-
-Changing geometry loading without touching these usually does **not** change interactive kinematics. Changing marker or State contracts ripples everywhere.
-
----
-
-## 12. Loading, interaction, and solver — unified story
+The result is a desired world-space COM position. It is not immediately applied on every mouse event. The latest position is queued, tiny changes are ignored, and a 16 ms timer consumes the most recent value. The conversion is in [`_screen_delta_to_world_delta`](../gui/viewer_3d.py#L764); throttling is in [`MainWindow.on_body_drag_move`](../main.py#L683).
 
 ```mermaid
-flowchart TB
-    STEP[STEP file] --> Geom[Immutable shapes]
-    Geom --> Phys[COM / inertia / local_frame]
-    Phys --> State0[State initial poses]
-    State0 --> FreeDrag[Free drag optional]
-    FreeDrag --> JointDef[Create joints + capture markers]
-    JointDef --> Graph[Joint graph exists]
-    Graph --> Live{User action}
-    Live -->|Drag connected body| DragSolve[solve_drag soft pin]
-    Live -->|Ctrl+K| Snap[solve_assembly]
-    Live -->|Drag free body| Free2[set_body_pose only]
-    DragSolve --> State1[State updated]
-    Snap --> State1
-    Free2 --> State1
-    State1 --> Delta[Renderer delta gp_Trsf]
-    Delta --> Screen[User sees mechanism]
-    Screen --> Live
+sequenceDiagram
+    participant Mouse
+    participant Viewer
+    participant Timer
+    participant Main as MainWindow
+    participant Solver
+    participant State
+    participant Renderer
+
+    Mouse->>Viewer: screen movement
+    Viewer->>Main: latest desired world position
+    Timer->>Main: apply pending update
+    alt body is joint-connected
+        Main->>Solver: soft-pinned component solve
+        Solver->>State: set poses for connected bodies
+    else body is free
+        Main->>State: set dragged body pose
+    end
+    Main->>Renderer: update moved body transforms
+    Renderer-->>Mouse: refreshed 3D view
 ```
 
-**One-sentence architecture:**  
-*Immutable CAD solids are placed by mutable world poses; joints bind poses through body-local markers; a damped least-squares solver keeps poses on the constraint manifold while the UI writes intent as a soft pin; OCC only displays deltas.*
+### 9.3 Pose-to-view transformation
 
----
+[`BodyRenderer`](../visualization/body_renderer.py#L15) stores the body's pose when its already-positioned CAD shape is first displayed. For a desired pose \((p_d,R_d)\) and base pose \((p_b,R_b)\), it computes:
 
-## 13. Legacy / known gaps (honest systems debt)
+\[
+R_\Delta=R_dR_b^T
+\]
 
-Documented so future work does not rediscover them:
+\[
+p_\Delta=p_d-R_\Delta p_b
+\]
 
-1. **JointRenderer** may still emphasize creation-time world `Joint.frame` more than live `marker_world(T, M)` — comments in `solve_assembly` note possible visual lag vs solver truth.  
-2. **`local_frame` mirroring** during drag updates origin/R for UI convenience; conceptually intrinsic COM frame vs extrinsic pose can blur — prefer reading `State` for “where is the body”.  
-3. **Drag LM on UI thread** with `max_iters=12` — fine for small assemblies; large dense components may need iteration caps, warm starts, or async solve with pose preview.  
-4. **Motors / forces** are model + export/visual concerns; they do **not** enter Φ(q) in the position solver.  
-5. **README joint list** may mention types not all implemented in solver enums — solver supports FIXED, REVOLUTE, PRISMATIC, CYLINDRICAL, SPHERICAL only.
+```python
+delta_rot = desired.rotation_matrix @ base.rotation_matrix.T
+delta_origin = desired.origin - (delta_rot @ base.origin)
+trsf = self._pose_to_trsf(delta_origin, delta_rot)
+ais_shape.SetLocalTransformation(trsf)
+```
 
----
+See [`update_body_transform`](../visualization/body_renderer.py#L311). Translation is divided by `unit_scale` inside [`_pose_to_trsf`](../visualization/body_renderer.py#L290) because OCC still displays the shape in imported model units.
 
-## 14. Summary
+Face, edge and vertex highlights receive the same local transform. Body-attached user frames are also synchronized. The original `TopoDS_Shape` is not modified.
 
-| Question | Answer in this codebase |
-|----------|-------------------------|
-| What never changes after load? | B-Rep geometry |
-| What is the live configuration? | `State.body_poses` |
-| What defines allowed relative motion? | `Joint` type + axis + markers |
-| What enforces that definition? | `KinematicSolver` (LM on Φ, J) |
-| How does the user drive it? | Soft-pinned drag + Ctrl+K snap |
-| How does the screen stay honest? | `SetLocalTransformation` deltas + highlight sync |
-| Why systems thinking? | Mechanism behavior is a loop property, not a single class feature |
+### 9.4 Renderer responsibilities
 
-The kinematic solver is the **constraint layer** that turned a pose-editable STEP viewer into a **mechanism pre-processor**: same State bus, same renderer contract, new balancing law on the joint graph.
+| Renderer | Visual output | Important note |
+|---|---|---|
+| [`BodyRenderer`](../visualization/body_renderer.py) | Shapes, highlight colour and COM marker | Reads live body poses |
+| [`FaceRenderer`](../visualization/face_renderer.py), [`EdgeRenderer`](../visualization/edge_renderer.py), [`VertexRenderer`](../visualization/vertex_renderer.py) | Selected feature highlight | Follows the body transform |
+| [`FrameRenderer`](../visualization/frame_renderer.py) | RGB coordinate axes | Can receive a body-local OCC transform |
+| [`JointRenderer`](../visualization/joint_renderer.py) | Joint frame | Draws `joint.frame`, not a live reconstructed marker |
+| [`ForceRenderer`](../visualization/force_renderer.py) | Blue straight arrow | Arrow length is logarithmically scaled for visibility |
+| [`TorqueRenderer`](../visualization/torque_renderer.py) | Magenta circular arrow | Radius is logarithmically scaled |
+| [`MotorRenderer`](../visualization/motor_renderer.py) | Control-type indicator at the joint | Visual definition only; no time simulation |
 
----
+The length of a force or torque symbol is a visualization choice and is not a geometrically exact representation of magnitude.
 
-## Appendix A — File quick index (solver-centric)
+## 10. Physical properties and load mathematics
 
-| Path | One-liner |
-|------|-----------|
-| `core/kinematics/markers.py` | SE(3)/SO(3) and marker capture |
-| `core/kinematics/graph.py` | Connected components / ground anchor |
-| `core/kinematics/constraints.py` | Residuals + analytic Jacobians |
-| `core/kinematics/solver.py` | LM, solve_assembly, solve_drag, analyze |
-| `core/kinematics/__init__.py` | Public exports + `capture_joint_markers` |
-| `core/data_structures.py` | Joint markers fields; State/Pose/RigidBody |
-| `main.py` | Drag integration, joint create, Ctrl+K |
-| `visualization/body_renderer.py` | Base pose + delta transform |
-| `tests/test_kinematics.py` | Headless correctness suite |
-| `Documentation/plan-kinematic-solver.md` | Original decision matrix / design plan |
-| `kinematics_solver_survey.md` | Library landscape research |
+### 10.1 Uniform-density geometric properties
 
-## Appendix B — Symbol cheat sheet
+OpenCASCADE's volume-property routine supplies volume-like mass, centre of mass and central inertia for a uniform solid. The code converts them to SI using the STEP scale \(s\), in metres per model unit.
 
-| Symbol | Meaning |
-|--------|---------|
-| `T` | Body world pose (R, p) |
-| `M` | Marker in body local frame |
-| `P = T∘M` | Marker in world |
-| `Φ(q)` | Stacked joint residuals |
-| `J = ∂Φ/∂δ` | Analytic Jacobian w.r.t. 6-DOF increments |
-| `δ = (dp, δω)` | Newton step in se(3)-style coords |
-| `λ` | LM damping parameter |
-| `rank(J)` | Independent constraint count |
-| `DOF` | `6 n_mov − rank(J)` (reported) |
+Volume:
+
+\[
+V_\mathrm{m^3}=V_\mathrm{model}\,s^3
+\]
+
+Centre of mass:
+
+\[
+c_\mathrm{m}=s\,c_\mathrm{model}
+\]
+
+Geometric inertia with assumed density \(1\ \mathrm{kg/m^3}\):
+
+\[
+I_\mathrm{SI}=I_\mathrm{model}\,s^5
+\]
+
+The fifth power appears because mass contributes three powers of length and the squared distance contributes two more.
+
+See [`calculate_volumes_for_bodies`](../core/physics_calculator.py#L49), [`calculate_center_of_mass`](../core/physics_calculator.py#L76) and [`calculate_inertia_tensor`](../core/physics_calculator.py#L134).
+
+The code does not currently store material density. Therefore:
+
+- `volume` is a geometric volume;
+- the reported inertia corresponds to unit density;
+- a downstream solver using density \(\rho\) should use \(m=\rho V\) and \(I_\rho=\rho I_{\rho=1}\).
+
+### 10.2 Forces and torques
+
+The domain objects normalize the user-provided direction:
+
+\[
+\hat{d}=\frac{d}{\lVert d\rVert}, \qquad F=F_\mathrm{mag}\hat{d}
+\]
+
+\[
+\hat{a}=\frac{a}{\lVert a\rVert}, \qquad \tau=\tau_\mathrm{mag}\hat{a}
+\]
+
+Zero directions are rejected. See [`Force`](../core/data_structures.py#L31) and [`Torque`](../core/data_structures.py#L66).
+
+These values are model definitions and viewer annotations. They are not used by the position-level kinematic solver.
+
+### 10.3 Motors
+
+Motors can be attached only to revolute and prismatic joints. Supported control descriptions are:
+
+- velocity: radians/second for revolute, metres/second for prismatic;
+- torque/force: newton-metres for revolute, newtons for prismatic;
+- position: radians for revolute, metres for prismatic.
+
+The current code stores and renders the motor definition; it does not enforce motor targets in the kinematic solver or advance them over time. See [`Joint.add_motor`](../core/data_structures.py#L142) and [`MotorDialog`](../gui/motor_dialog.py#L12).
+
+## 11. Export and persistence
+
+There are two different serialization paths with different purposes.
+
+### 11.1 Assembly JSON and OBJ export
+
+[`export_assembly_to_json`](../export/exporter.py#L29) writes:
+
+```text
+assembly.json
+├── metadata
+├── ground_body
+├── bodies[]
+│   ├── id, name, volume, contact_enabled
+│   ├── center_of_mass
+│   ├── inertia_tensor
+│   ├── local_frame
+│   └── mesh_file
+├── joints[]
+│   ├── type, axis, connected body IDs/names
+│   ├── motor data, when present
+│   └── frame_world
+└── frames{}
+
+meshes/
+└── <body name>_<id>.obj
+```
+
+Each OBJ is tessellated from the unchanged OCC shape. Vertices are scaled to metres and transformed into a COM-centred body frame:
+
+\[
+v_\text{local}=R_\text{body}^T(v_\text{world}-c_\text{body})
+\]
+
+See [`_export_shape_to_obj`](../export/exporter.py#L285).
+
+Important current boundaries:
+
+- forces and torques are **not** included in assembly JSON;
+- live `State.body_poses` are not serialized as a separate field;
+- joint-local solver markers are not exported;
+- the joint's stored `frame_world` is exported directly;
+- `contact_enabled` is metadata only; no contact geometry or contact detection is generated.
+
+Consumers must use the actual schema in [`exporter.py`](../export/exporter.py), not assume every UI object is present.
+
+### 11.2 `.mbdp` project files
+
+Project save is intended to reopen an editing session. Version 1.0 stores:
+
+- absolute STEP file path;
+- unit scale;
+- created frame names, origins and rotations;
+- joint names, types, body IDs, frame values and axes.
+
+It does not currently store:
+
+- body poses;
+- frame-to-body ownership;
+- forces or torques;
+- motor settings;
+- visibility/contact choices;
+- joint marker values.
+
+Markers are recaptured from the current body poses when possible. Also note that STEP loading is asynchronous while the current restore loop proceeds immediately; project restoration can therefore race the load/reset process. This persistence path should be treated as incomplete until restoration is sequenced after the STEP worker result.
+
+See [`save_project`](../main.py#L2156) and [`load_project`](../main.py#L2228).
+
+## 12. End-to-end workflows
+
+### 12.1 From STEP file to editable assembly
+
+```text
+STEP path
+  -> StepParser: OCC shape + unit_scale
+  -> one RigidBody per solid
+  -> PhysicsCalculator: volume + COM + inertia + local frame
+  -> State: initial world pose per body
+  -> BodyRenderer: AIS shape + base pose
+  -> GeometryUtils: face/edge/vertex properties
+  -> Viewer mappings: OCC selection back to body/feature IDs
+```
+
+### 12.2 From selected geometry to a constrained mechanism
+
+```text
+feature click
+  -> (body_id, feature_index)
+  -> feature properties
+  -> named Frame
+  -> Joint dialog chooses frame, bodies, type and axis
+  -> world joint frame converted to two body-local markers
+  -> JointGraph connects the affected bodies
+  -> solver can now assemble or drag the mechanism
+```
+
+### 12.3 From drag gesture to pixels
+
+```text
+screen delta
+  -> desired COM position in the camera plane
+  -> latest target queued
+  -> 16 ms timer
+  -> free pose update OR soft-pinned joint solve
+  -> State.set_body_pose for moved bodies
+  -> body delta transforms
+  -> highlight and attached-frame transform sync
+  -> OCC viewer refresh
+```
+
+### 12.4 From edited model to downstream files
+
+```text
+bodies + physical properties + joints + frames
+  -> JSON serializer
+unchanged OCC body shapes + body frames
+  -> tessellation
+  -> COM-centred OBJ meshes
+```
+
+Forces and torques stop at the UI/domain/visualization boundary in the current implementation and do not enter this export flow.
+
+## 13. Architectural contracts
+
+Changes are safest when these contracts remain true:
+
+1. **Geometry is stable.** Do not move bodies by rewriting `TopoDS_Shape`; update `State`.
+2. **`State` is the live pose bus.** Solver and interaction code write there; renderers read from it.
+3. **Domain lengths use metres.** Convert only at import and at OCC/mesh boundaries.
+4. **Joint meaning lives in local markers.** `joint.frame` is the creation/display/export frame; solver constraints use `marker1` and `marker2`.
+5. **Ground has ID `-1`.** It participates in the joint graph but contributes no unknown pose.
+6. **OCC display work stays on the Qt main thread.** The STEP worker returns data, not AIS objects.
+7. **Kinematics stays headless.** Avoid Qt or OCC imports in `core/kinematics`.
+8. **Renderer objects are adapters, not model storage.** AIS transforms and colours should not become authoritative domain state.
+9. **Export behavior is explicit.** Adding a new domain object does not automatically add it to JSON, project save or OBJ export.
+
+## 14. Extension guide
+
+### Add a new joint type
+
+Update all of the following:
+
+1. [`JointType`](../core/data_structures.py#L15);
+2. the joint creation dialog;
+3. `CONSTRAINT_COUNT` and residual equations in [`constraints.py`](../core/kinematics/constraints.py);
+4. the matching analytic derivative;
+5. motor rules if the joint can be actuated;
+6. renderer/export behavior;
+7. finite-difference and mechanism tests.
+
+### Add a new exported entity
+
+Trace the entire path:
+
+```text
+dialog/input -> domain object -> MainWindow collection -> tree/properties
+-> renderer -> assembly JSON -> project save/load -> deletion cleanup -> tests
+```
+
+For example, forces already cover the path through rendering but currently stop before both serialization formats.
+
+### Add density or material support
+
+The natural location is on `RigidBody`. Keep geometric volume and unit-density inertia as import results, then derive:
+
+\[
+m=\rho V,\qquad I=\rho I_{\rho=1}
+\]
+
+Decide whether export stores raw geometry properties, material properties, derived mass properties, or all three, and label units clearly.
+
+### Add dynamics
+
+Dynamics should be a separate system that reads the prepared model. It would need, at minimum:
+
+- mass and material density;
+- generalized velocities;
+- force, torque and motor evaluation;
+- equations of motion and constraint stabilization;
+- time integration;
+- contact geometry and collision handling.
+
+It should not be hidden inside the current position-level assembly solver.
+
+## 15. Tests and verification
+
+The main architecture boundaries are covered by:
+
+| Test | What it protects |
+|---|---|
+| [`test_kinematics.py`](../tests/test_kinematics.py) | Joint equations, analytic derivatives, closed loops, redundancy and soft drag |
+| [`test_unit_conversion.py`](../tests/test_unit_conversion.py) and [`test_units.py`](../tests/test_units.py) | Model-unit to SI conversion |
+| [`test_volume.py`](../tests/test_volume.py), [`test_com.py`](../tests/test_com.py) | OCC physical properties |
+| [`test_frame_from_edge.py`](../tests/test_frame_from_edge.py) | Feature-to-frame geometry |
+| [`test_joint_structure.py`](../tests/test_joint_structure.py) | Joint domain structure |
+| [`test_joint_renderer.py`](../tests/test_joint_renderer.py) | Joint visualization |
+| [`test_original_step.py`](../tests/test_original_step.py) | Import behavior on the sample STEP file |
+
+The headless kinematic suite can be run directly:
+
+```bash
+python tests/test_kinematics.py
+```
+
+OCC-backed tests require `pythonocc-core` and some GUI tests may require a working display/Qt environment.
+
+## 16. Quick code index
+
+| Need to change | Start here |
+|---|---|
+| Startup, menus or workflow coordination | [`main.py`](../main.py) |
+| A domain field or supported joint/motor type | [`core/data_structures.py`](../core/data_structures.py) |
+| STEP unit or solid-import behavior | [`core/step_parser.py`](../core/step_parser.py) |
+| Volume, COM, inertia or local body frame | [`core/physics_calculator.py`](../core/physics_calculator.py) |
+| Face/edge/vertex properties or frame construction | [`core/geometry_utils.py`](../core/geometry_utils.py) |
+| Joint equations or derivatives | [`core/kinematics/constraints.py`](../core/kinematics/constraints.py) |
+| Solve convergence, weighting or diagnostics | [`core/kinematics/solver.py`](../core/kinematics/solver.py) |
+| Body picking, camera behavior or screen-to-world drag | [`gui/viewer_3d.py`](../gui/viewer_3d.py) |
+| Pose-to-OCC transformation | [`visualization/body_renderer.py`](../visualization/body_renderer.py) |
+| JSON schema or OBJ generation | [`export/exporter.py`](../export/exporter.py) |
+
+## 17. One-paragraph mental model
+
+The STEP parser supplies unchanged CAD solids and a unit conversion. Physical-property code derives SI-valued volume, COM and inertia, and the application creates one live pose per body in `State`. Selecting CAD features produces reference frames; those frames become joint locations or load locations. A joint stores two body-local markers so its intended relationship survives body movement. The kinematic solver works on connected groups of bodies and writes valid poses back to `State`, while the body renderer converts each pose into a local OpenCASCADE transform relative to the imported geometry. The exporter writes the currently supported body, frame, joint and motor metadata plus COM-centred meshes; other UI definitions remain inside the application until their serialization paths are implemented.
