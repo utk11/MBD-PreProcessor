@@ -215,7 +215,68 @@ class PhysicsCalculator:
                 body.inertia_tensor = None
                 print(f"Body {body.id} ({body.name}): Inertia calculation failed")
         
-        print("Inertia tensor calculation complete.")    
+        print("Inertia tensor calculation complete.")
+
+    @staticmethod
+    def calculate_mass_properties(shape: TopoDS_Shape, unit_scale: float = 1.0):
+        """Volume, centre of mass, and inertia from one ``GProp_GProps`` pass.
+
+        Returns ``(volume_m3, com_m, inertia)``. A failed or non-positive volume
+        still returns the centre and inertia when OpenCASCADE produced them.
+        """
+        props = GProp_GProps()
+        brepgprop.VolumeProperties(shape, props)
+        volume_scale = unit_scale ** 3
+        inertia_scale = unit_scale ** 5
+        volume = float(props.Mass()) * volume_scale
+        centre = props.CentreOfMass()
+        com = [
+            centre.X() * unit_scale,
+            centre.Y() * unit_scale,
+            centre.Z() * unit_scale,
+        ]
+        matrix = props.MatrixOfInertia()
+        components = [
+            matrix.Value(1, 1), matrix.Value(1, 2), matrix.Value(1, 3),
+            matrix.Value(2, 2), matrix.Value(2, 3), matrix.Value(3, 3),
+        ]
+        ixx, ixy, ixz, iyy, iyz, izz = [value * inertia_scale for value in components]
+        inertia = np.array([
+            [ixx, ixy, ixz],
+            [ixy, iyy, iyz],
+            [ixz, iyz, izz],
+        ])
+        if volume <= 0.0:
+            volume = 0.0
+        return volume, com, inertia
+
+    @staticmethod
+    def calculate_mass_properties_for_bodies(bodies: list, unit_scale: float = 1.0) -> None:
+        """Fill volume, centre of mass, and inertia, then the reference frames."""
+        print(f"Calculating mass properties with one GProp pass per body (unit scale {unit_scale}).")
+        for body in bodies:
+            if body.shape is None:
+                body.volume = 0.0
+                body.center_of_mass = None
+                body.inertia_tensor = None
+                continue
+            try:
+                volume, com, inertia = PhysicsCalculator.calculate_mass_properties(body.shape, unit_scale)
+            except Exception as exc:
+                print(f"Body {body.id} ({body.name}): mass properties failed: {exc}")
+                body.volume = 0.0
+                body.center_of_mass = None
+                body.inertia_tensor = None
+                continue
+            body.volume = volume
+            body.center_of_mass = com
+            body.inertia_tensor = inertia
+            print(
+                f"Body {body.id} ({body.name}): volume={volume:.6e} m³, "
+                f"COM=[{com[0]:.6f}, {com[1]:.6f}, {com[2]:.6f}] m"
+            )
+        PhysicsCalculator.initialize_local_frames(bodies)
+
     @staticmethod
     def initialize_local_frames(bodies: list):
         """

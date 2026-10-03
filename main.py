@@ -50,8 +50,18 @@ load_backend('pyside6')
 # Import core modules
 from core.step_parser import StepParser
 from core.data_structures import RigidBody, Frame, Joint, JointType, Force, Torque, MotorType, State, Pose
+from core.assembly_document import AssemblyDocument
+from core.joint_factory import AXIAL_JOINTS, JointFrameOption, axis_alignment, make_joint
+from core.transforms import attachment_reference_frame, attachment_world_frame, body_world_frame
 from core.physics_calculator import PhysicsCalculator
 from core.geometry_utils import GeometryUtils, FaceProperties, EdgeProperties, VertexProperties
+from core.project_store import (
+    ProjectValidationError,
+    prepare_import_document,
+    read_project,
+    resolve_step_file,
+    save_project as write_project_file,
+)
 
 # Import GUI modules
 from gui.body_tree_widget import BodyTreeWidget
@@ -61,6 +71,7 @@ from gui.joint_dialog import JointCreationDialog
 from gui.force_dialog import ForceDialog
 from gui.torque_dialog import TorqueDialog
 from gui.motor_dialog import MotorDialog
+from gui.application_controller import ApplicationController
 
 # Import visualization modules
 from visualization.body_renderer import BodyRenderer
@@ -76,21 +87,38 @@ from visualization.motor_renderer import MotorRenderer
 # Import export module
 from export.exporter import AssemblyExporter
 
-# Kinematic assembly solver (SolveSpace-style position-level constraints)
-from core.kinematics import KinematicSolver, capture_joint_markers
+# Kinematic assembly solver (JAX-backed session). The GUI commits results itself.
+
+
+class ImportPayload:
+    """Geometry produced by the import worker. Viewer objects are created later on the GUI thread."""
+
+    def __init__(self, generation: int, filepath: str, bodies: list, unit_scale: float,
+                 faces: dict, edges: dict, vertices: dict):
+        self.generation = generation
+        self.filepath = filepath
+        self.bodies = bodies
+        self.unit_scale = unit_scale
+        self.faces = faces
+        self.edges = edges
+        self.vertices = vertices
 
 
 class StepLoadWorker(QThread):
-    """Background worker for loading STEP files and running physics calculations.
-    This keeps the UI responsive during potentially slow operations.
-    """
-    progress = Signal(str)           # status message
-    result = Signal(list, float)     # bodies, unit_scale
-    error = Signal(str)
+    """Background worker for STEP import, one mass-property pass, and feature extraction.
 
-    def __init__(self, filepath: str):
+    The worker owns the shape until it emits a payload. The GUI thread creates
+    viewer objects after that. An older payload carries its generation and is
+    ignored if a newer import has started.
+    """
+    progress = Signal(str)
+    result = Signal(object)
+    error = Signal(int, str)
+
+    def __init__(self, filepath: str, generation: int):
         super().__init__()
         self.filepath = filepath
+        self.generation = int(generation)
 
     def run(self):
         try:
@@ -98,35 +126,48 @@ class StepLoadWorker(QThread):
             shape, unit_scale = StepParser.load_step_file(self.filepath)
 
             if shape is None:
-                self.error.emit("Could not load STEP file (invalid or empty).")
+                self.error.emit(self.generation, "Could not load STEP file (invalid or empty).")
                 return
 
             self.progress.emit("Extracting individual bodies...")
             bodies = StepParser.extract_bodies_from_compound(shape)
 
-            self.progress.emit("Calculating volumes...")
-            PhysicsCalculator.calculate_volumes_for_bodies(bodies, unit_scale)
+            self.progress.emit("Calculating mass properties...")
+            PhysicsCalculator.calculate_mass_properties_for_bodies(bodies, unit_scale)
 
-            self.progress.emit("Calculating centers of mass...")
-            PhysicsCalculator.calculate_centers_of_mass_for_bodies(bodies, unit_scale)
+            self.progress.emit("Extracting faces, edges, and vertices...")
+            faces = {}
+            edges = {}
+            vertices = {}
+            for body in bodies:
+                if body.shape is None:
+                    continue
+                faces[body.id] = GeometryUtils.extract_faces(body.shape, unit_scale)
+                edges[body.id] = GeometryUtils.extract_edges(body.shape, unit_scale)
+                vertices[body.id] = GeometryUtils.extract_vertices(body.shape, unit_scale)
 
-            self.progress.emit("Calculating inertia tensors...")
-            PhysicsCalculator.calculate_inertia_tensors_for_bodies(bodies, unit_scale)
-
-            self.progress.emit("Initializing local frames...")
-            PhysicsCalculator.initialize_local_frames(bodies)
-
-            self.result.emit(bodies, unit_scale)
+            self.result.emit(ImportPayload(
+                self.generation, self.filepath, bodies, unit_scale, faces, edges, vertices
+            ))
 
         except Exception as e:
             import traceback
             traceback.print_exc()
-            self.error.emit(f"Error loading file: {str(e)}")
+            self.error.emit(self.generation, f"Error loading file: {str(e)}")
 
 
 class MainWindow(QMainWindow):
     """Main application window with 3D viewer"""
-    
+    load_finished = Signal(int, bool, str)
+
+    @property
+    def assembly_state(self):
+        return self.document.state
+
+    @assembly_state.setter
+    def assembly_state(self, value):
+        self.document.state = value
+
     def __init__(self):
         super().__init__()
         self.setWindowTitle("Multi-Body Dynamics Preprocessor")
@@ -167,12 +208,18 @@ class MainWindow(QMainWindow):
         # Initialize the display
         self.display = self.viewer_3d._display
         
-        # Initialize body storage
-        self.bodies: List[RigidBody] = []
-
-        # Mutable State holding current positions/orientations for the assembly and all bodies.
-        # Populated after loading a STEP file. Bodies reference it via body.state.
-        self.assembly_state: Optional[State] = None
+        # The document owns bodies, joints, frames, loads, poses, and revisions.
+        # The attributes below are the same objects, so existing widget code can
+        # keep reading them. Mutations that change connectivity go through the document.
+        self.document = AssemblyDocument()
+        self.bodies = self.document.bodies
+        self.assembly_state = None
+        self._load_generation = 0
+        self._pending_project = None
+        self._load_workers = set()
+        self._close_requested = False
+        self.control_bridge = None
+        self._pending_load_interactive = True
 
         # --- Drag update throttling for smoothness ---
         # MouseMove can fire at very high rates. We use a timer to apply visual
@@ -255,20 +302,12 @@ class MainWindow(QMainWindow):
         self.edge_properties_map: Dict[int, List[EdgeProperties]] = {}  # body_id -> list of EdgeProperties
         self.vertex_properties_map: Dict[int, List[VertexProperties]] = {}  # body_id -> list of VertexProperties
 
-        # Store user-created frames (name -> Frame)
-        self.created_frames: Dict[str, Frame] = {}
-        
-        # Frame-to-body association tracking (replaces fragile string matching)
-        self.frame_to_body_map: Dict[str, int] = {}  # frame_name -> body_id
-        
-        # Store joints (name -> Joint)
-        self.joints: Dict[str, Joint] = {}
-        
-        # Store forces (name -> Force)
-        self.forces: Dict[str, Force] = {}
-        
-        # Store torques (name -> Torque)
-        self.torques: Dict[str, Torque] = {}
+        # Same dictionaries the document owns.
+        self.created_frames = self.document.frames
+        self.frame_to_body_map = self.document.frame_to_body
+        self.joints = self.document.joints
+        self.forces = self.document.forces
+        self.torques = self.document.torques
         
         # Isolation mode state
         self.isolation_active: bool = False
@@ -300,10 +339,35 @@ class MainWindow(QMainWindow):
         # Track current STEP file path for project saving
         self.current_step_file: Optional[str] = None
 
+        self.controller = ApplicationController(self)
+        self.controller.attach_viewer()
+        self.controller.scheduler.shutdown_finished.connect(self._finish_close_if_ready)
+
         print("Application initialized successfully!")
         print("Viewer ready. Use File > Open to load a STEP file.")
         print("Mouse controls: Left-click/drag on body to select & move (in Body mode); Right-drag to rotate view; Middle-drag to pan; Wheel to zoom.")
         print("View menu: snap to Top/Bottom/Front/Back/Left/Right or Isometric views.")
+
+    def closeEvent(self, event):
+        """Keep Qt worker owners alive until active work and cleanup finish."""
+        if not self._close_requested:
+            self._close_requested = True
+            if getattr(self, "control_bridge", None) is not None:
+                self.control_bridge.close()
+            self._drag_update_timer.stop()
+            self.setEnabled(False)
+            self.controller.shutdown()
+        if not self.controller.scheduler.is_stopped or any(worker.isRunning() for worker in self._load_workers):
+            event.ignore()
+            self.statusBar().showMessage("Closing after the current calculation finishes...")
+            return
+        super().closeEvent(event)
+
+    def _finish_close_if_ready(self):
+        if self._close_requested and self.controller.scheduler.is_stopped and not any(
+            worker.isRunning() for worker in self._load_workers
+        ):
+            self.close()
     
     def create_menu_bar(self):
         """Create the menu bar with File menu"""
@@ -445,33 +509,30 @@ class MainWindow(QMainWindow):
     def load_step_file(self, filepath):
         """Load and display a STEP file (heavy work runs in background thread)."""
         print(f"Loading STEP file: {filepath}")
-        
-        # Store the current STEP file path
-        self.current_step_file = filepath
+        self._pending_project = None
+        self._start_import(filepath)
 
-        # Clear previous display and bodies (must be done on main thread)
-        self._clear_ui_for_new_load()
-
-        # Reset selection mode
+    def _start_import(self, filepath, project=None, interactive=True):
+        """Import CAD on the worker. The open document stays until this succeeds."""
+        if self._close_requested:
+            return
+        self._load_generation += 1
+        self._pending_project = project
+        self._pending_load_interactive = interactive
         self.property_panel.set_selection_mode("Body")
-
-        # Disable interaction while loading
         self.setEnabled(False)
         if hasattr(self, 'statusBar'):
             self.statusBar().showMessage("Loading STEP file...")
 
-        # If a previous load is running, stop it
-        if hasattr(self, 'load_worker') and self.load_worker and self.load_worker.isRunning():
-            self.load_worker.quit()
-            self.load_worker.wait()
-
-        # Start background worker
-        self.load_worker = StepLoadWorker(filepath)
+        self.load_worker = StepLoadWorker(filepath, self._load_generation)
+        self._load_workers.add(self.load_worker)
         self.load_worker.progress.connect(self.on_load_progress)
         self.load_worker.result.connect(self.on_load_result)
         self.load_worker.error.connect(self.on_load_error)
         self.load_worker.finished.connect(self._on_load_worker_finished)
+        self.load_worker.finished.connect(self.load_worker.deleteLater)
         self.load_worker.start()
+        return self._load_generation
 
     def _clear_ui_for_new_load(self):
         """Clear all previous data (called on main thread before starting load)."""
@@ -520,77 +581,101 @@ class MainWindow(QMainWindow):
 
 
     def on_load_progress(self, message: str):
+        if self._close_requested:
+            return
         print(message)
         if hasattr(self, 'statusBar'):
             self.statusBar().showMessage(message)
 
-    def on_load_result(self, bodies: list, unit_scale: float):
-        """Called on main thread when background loading succeeds."""
-        print(f"Load complete. Received {len(bodies)} bodies.")
+    def on_load_result(self, payload: ImportPayload):
+        """Install an import only after it succeeds, and only if it is still current."""
+        if self._close_requested or payload.generation != self._load_generation:
+            print(f"Ignoring stale import generation {payload.generation}.")
+            return
+        project = self._pending_project
+        try:
+            staged, notes, imported_poses = prepare_import_document(
+                payload.bodies, payload.unit_scale, payload.filepath, project
+            )
+        except ProjectValidationError as exc:
+            if getattr(self, "_pending_load_interactive", True):
+                QMessageBox.critical(self, "Load Error", str(exc))
+            if hasattr(self, "load_finished"):
+                self.load_finished.emit(payload.generation, False, str(exc))
+            print(f"Project restoration failed; current document kept: {exc}")
+            return
+        print(f"Load complete. Received {len(payload.bodies)} bodies.")
+        self._clear_ui_for_new_load()
+        self.document.install(staged)
+        self.current_step_file = payload.filepath
+        unit_scale = payload.unit_scale
         self.unit_scale = unit_scale
 
         # Update renderers
         self.frame_renderer.set_unit_scale(unit_scale)
+        self.joint_renderer.frame_renderer.set_unit_scale(unit_scale)
         self.body_renderer.set_unit_scale(unit_scale)
         self.force_renderer.set_unit_scale(unit_scale)
         self.torque_renderer.set_unit_scale(unit_scale)
         self.vertex_renderer.set_unit_scale(unit_scale)
-
-        self.bodies = bodies
+        self.viewer_3d.set_unit_scale(unit_scale)
 
         print(f"Found {len(self.bodies)} body/bodies in the assembly:")
         for body in self.bodies:
             print(f"  - {body.name} (ID: {body.id})")
 
-        # Create and attach the mutable State
-        self.assembly_state = State()
-        for body in self.bodies:
-            if body.local_frame is not None:
-                self.assembly_state.set_body_pose(
-                    body.id,
-                    body.local_frame.origin.copy(),
-                    body.local_frame.rotation_matrix.copy()
-                )
-            body.state = self.assembly_state
         print(f"State initialized for {len(self.bodies)} bodies.")
 
-        # Update UI
+        # Saved placement is already restored. CAD geometry still has its
+        # imported placement, so supply that baseline explicitly.
         self.body_tree.update_bodies(self.bodies)
-        self.body_renderer.display_bodies(self.bodies)
+        self.body_renderer.display_bodies(self.bodies, base_poses=imported_poses)
 
-        # Continue with face/edge/vertex extraction and rest of setup
+        kept = {body.id for body in self.bodies}
+        self.face_properties_map = {bid: values for bid, values in payload.faces.items() if bid in kept}
+        self.edge_properties_map = {bid: values for bid, values in payload.edges.items() if bid in kept}
+        self.vertex_properties_map = {bid: values for bid, values in payload.vertices.items() if bid in kept}
         self._finish_step_load(unit_scale)
+        self.controller.on_document_replaced()
+        if project is not None:
+            self._show_restored_project(notes, notify=self._pending_load_interactive)
+        self.load_finished.emit(payload.generation, True, "\n".join(notes))
 
-    def on_load_error(self, message: str):
-        QMessageBox.critical(self, "Load Error", message)
+    def on_load_error(self, generation: int, message: str):
+        if self._close_requested or generation != self._load_generation:
+            return
+        if self._pending_load_interactive:
+            QMessageBox.critical(self, "Load Error", message)
+        self.load_finished.emit(generation, False, message)
         print("Load error:", message)
+        print("The current project was left unchanged.")
         self.setEnabled(True)
         if hasattr(self, 'statusBar'):
             self.statusBar().showMessage("Load failed")
 
     def _on_load_worker_finished(self):
-        """Cleanup after worker thread ends."""
-        self.setEnabled(True)
-        if hasattr(self, 'statusBar'):
-            self.statusBar().showMessage("Ready")
+        """Re-enable the window after the import thread ends.
+
+        Status text is left to the load result. A successful import may already
+        be preparing the solver, and a failure has already reported itself.
+        """
+        worker = self.sender()
+        self._load_workers.discard(worker)
+        if worker is getattr(self, "load_worker", None):
+            self.load_worker = None
+        if self._close_requested:
+            self._finish_close_if_ready()
+        elif not self._load_workers:
+            self.setEnabled(True)
 
     def _finish_step_load(self, unit_scale: float):
         """Second part of STEP loading that must happen on main thread after bodies exist."""
-        # Extract face and edge properties for all bodies
-        print("\nExtracting face, edge, and vertex properties...")
-        self.face_properties_map.clear()
-        self.edge_properties_map.clear()
-        self.vertex_properties_map.clear()
         bodies_dict = {}
-
         for body in self.bodies:
-            self.face_properties_map[body.id] = GeometryUtils.extract_faces(body.shape, unit_scale)
-            self.edge_properties_map[body.id] = GeometryUtils.extract_edges(body.shape, unit_scale)
-            self.vertex_properties_map[body.id] = GeometryUtils.extract_vertices(body.shape, unit_scale)
             bodies_dict[body.id] = body
-            print(f"Body {body.id}: {len(self.face_properties_map[body.id])} faces, "
-                  f"{len(self.edge_properties_map[body.id])} edges, "
-                  f"{len(self.vertex_properties_map[body.id])} vertices")
+            print(f"Body {body.id}: {len(self.face_properties_map.get(body.id, []))} faces, "
+                  f"{len(self.edge_properties_map.get(body.id, []))} edges, "
+                  f"{len(self.vertex_properties_map.get(body.id, []))} vertices")
 
         self.viewer_3d.set_body_mapping(self.body_renderer.body_ais_shapes, bodies_dict)
 
@@ -632,6 +717,31 @@ class MainWindow(QMainWindow):
         if hasattr(self, 'statusBar'):
             self.statusBar().showMessage("Ready")
 
+    def _show_restored_project(self, notes: List[str], notify: bool = True):
+        """Draw restored frames, joints, and loads, then report migration limits."""
+        for frame in self.created_frames.values():
+            self._rerender_user_frame(frame.name)
+        for joint in self.joints.values():
+            self.joint_renderer.render_joint(joint, bodies=self.bodies, ground_body=self.ground_body)
+        for force in self.forces.values():
+            self.force_renderer.render_force(force)
+        for torque in self.torques.values():
+            self.torque_renderer.render_torque(torque)
+        self.body_tree.update_frames(self.created_frames.values())
+        self.body_tree.update_joints_list(self.joints.values())
+        self.body_tree.update_forces_list(self.forces.values())
+        self.body_tree.update_torques_list(self.torques.values())
+        if not notify:
+            return
+        if notes:
+            QMessageBox.information(
+                self,
+                "Project Loaded",
+                "Project loaded.\n\n" + "\n".join(f"- {note}" for note in notes),
+            )
+        else:
+            QMessageBox.information(self, "Project Loaded", "Project loaded.")
+
     def on_body_clicked_in_viewer(self, body_id: int):
         """
         Handle body click selection from the 3D viewer.
@@ -670,130 +780,85 @@ class MainWindow(QMainWindow):
     def on_body_drag_start(self, body_id: int):
         """Called when the user starts dragging a body in the viewer."""
         print(f"Drag started on body {body_id}")
-        # Make sure the property panel shows the body
         self.on_body_selected(body_id)
-
-        # Cache for performance and start throttled update timer
         self._dragging_body_ref = next((b for b in self.bodies if b.id == body_id), None)
         self._pending_drag_body_id = body_id
         self._pending_drag_pos = None
         self._last_applied_drag_pos = None
+        self.controller.on_drag_start(body_id)
         self._drag_update_timer.start()
 
     def on_body_drag_move(self, body_id: int, new_world_pos: np.ndarray):
-        """Very lightweight: just record the latest desired position.
-        The actual State + visual update happens in the timer at fixed rate.
-        This decouples high-frequency mouse events from rendering.
-        """
-        self._pending_drag_pos = new_world_pos
-        # We keep _pending_drag_body_id set from start
-        # No heavy work here → much higher effective FPS
+        """Record the latest mouse target. The timer submits it to the solver."""
+        self._pending_drag_pos = np.array(new_world_pos, dtype=float, copy=True)
 
     def on_body_drag_end(self, body_id: int):
-        """Called when the user releases the mouse after dragging.
-        Refresh expensive visuals (local frame, COM marker) once at the end.
-        """
+        """Keep the last mouse target, then ask for a diagnostic on the settled pose."""
         print(f"Drag ended on body {body_id}")
-
-        # Stop the throttled update timer
         self._drag_update_timer.stop()
+        pending = None if self._pending_drag_pos is None else np.array(self._pending_drag_pos, copy=True)
         self._pending_drag_body_id = None
         self._pending_drag_pos = None
         self._dragging_body_ref = None
         self._last_applied_drag_pos = None
-
-        body = next((b for b in self.bodies if b.id == body_id), None)
-        if not body:
-            return
-
-        # Refresh local frame once (if it was the selected body and visible)
-        if self.selected_body_id == body_id and body.local_frame is not None:
-            try:
-                visible = self.property_panel.local_frame_checkbox.isChecked()
-            except Exception:
-                visible = True
-            self.frame_renderer.render_frame(body.local_frame, visible=visible)
-
-        # Refresh COM marker once
-        if (self.body_renderer.currently_highlighted_id == body_id and
-                self.body_renderer.com_marker_visible):
-            self.body_renderer._update_com_marker(body_id)
-
-        self.display.Repaint()
+        constrained = body_id in self.document.constrained_body_ids()
+        if pending is not None:
+            self.controller.submit_drag_target(body_id, pending)
+        if constrained:
+            self.controller.finish_drag(body_id)
+        else:
+            self._refresh_settled_visuals()
 
     def _apply_pending_drag_update(self):
-        """Called by timer at fixed rate (e.g. 60 FPS).
-        Applies the latest pending pose if any. This gives smooth, consistent updates
-        even if mouse events come faster or slower.
-        """
+        """Submit the latest mouse point. The worker replaces any older pending target."""
         if self._pending_drag_body_id is None or self._pending_drag_pos is None:
             return
-
         body_id = self._pending_drag_body_id
-        new_pos = self._pending_drag_pos
-
-        # Use cached body ref for speed
-        body = self._dragging_body_ref
-        if body is None or body.state is None:
+        new_pos = np.array(self._pending_drag_pos, dtype=float, copy=True)
+        if self._dragging_body_ref is None or self._dragging_body_ref.state is None:
             return
-
         try:
-            # Skip tiny changes for smoothness (avoid unnecessary Redisplay/Repaint)
             if self._last_applied_drag_pos is not None:
-                diff = np.linalg.norm(new_pos - self._last_applied_drag_pos)
-                if diff < 1e-5:  # ~0.01mm threshold
-                    self._pending_drag_pos = None
+                if np.array_equal(new_pos, self._last_applied_drag_pos):
                     return
-
-            current_rot = body.get_world_rotation_matrix()
-
-            # If the body participates in any joint, solve the connected
-            # component with the mouse pose as a soft pin (SolveSpace-style).
-            moved_ids = [body_id]
-            if self.joints and self.assembly_state is not None:
-                connected = any(
-                    j.body1_id == body_id or j.body2_id == body_id
-                    for j in self.joints.values()
-                )
-                if connected:
-                    solver = self._make_kinematic_solver()
-                    rep = solver.solve_drag(
-                        body_id,
-                        new_pos,
-                        current_rot,
-                        pin_weight=1.0,
-                        max_iters=12,
-                        tol=1e-6,
-                        pin_orientation=False,
-                    )
-                    moved_ids = rep.moved_bodies or [body_id]
-                else:
-                    self.assembly_state.set_body_pose(body_id, new_pos, current_rot)
-            else:
-                self.assembly_state.set_body_pose(body_id, new_pos, current_rot)
-
-            # Update body visuals for every body the solver touched
-            for bid in moved_ids:
-                self.body_renderer.update_body_transform(bid)
-                self._sync_highlight_transforms(bid)
-                self._sync_body_attached_frames(bid)
-                b = next((bb for bb in self.bodies if bb.id == bid), None)
-                if b is not None and b.local_frame is not None:
-                    pose = self.assembly_state.get_body_pose(bid)
-                    if pose is not None:
-                        b.local_frame.origin = pose.origin.copy()
-                        b.local_frame.rotation_matrix = pose.rotation_matrix.copy()
-
-            # Push the change and repaint at controlled rate.
-            # Redisplay was called with False in the renderer.
-            self.body_renderer.display.Context.UpdateCurrentViewer()
-            self.display.Repaint()
-
-            self._last_applied_drag_pos = new_pos.copy()
-            # Consume the pending so we don't re-apply the same pose
-            self._pending_drag_pos = None
+            self.controller.submit_drag_target(body_id, new_pos)
+            self._last_applied_drag_pos = new_pos
         except Exception as e:
             print(f"Error in throttled drag update for {body_id}: {e}")
+
+    def _on_solver_body_changed(self, body_id: int):
+        """Follow a committed pose. The reference frame itself is not rewritten."""
+        self._sync_highlight_transforms(body_id)
+        self._sync_body_attached_frames(body_id, update_viewer=False)
+        if self.selected_body_id != body_id:
+            return
+        body = self.document.body_by_id(body_id)
+        if body is None or body.local_frame is None:
+            return
+        trsf = self._body_ais_local_trsf(body_id)
+        if trsf is None:
+            return
+        try:
+            self.frame_renderer.update_frame_local_trsf(
+                body.local_frame.name, trsf, update_viewer=False
+            )
+        except Exception:
+            pass
+
+    def _on_solver_settled(self, _report):
+        """Refresh joint graphics and the COM marker after a drag release or assembly solve."""
+        self._refresh_settled_visuals()
+
+    def _refresh_settled_visuals(self):
+        for joint in self.joints.values():
+            self.joint_renderer.render_joint(joint, bodies=self.bodies, ground_body=self.ground_body)
+        highlighted = self.body_renderer.currently_highlighted_id
+        if highlighted is not None and self.body_renderer.com_marker_visible:
+            body = self.document.body_by_id(highlighted)
+            if body is not None:
+                self.body_renderer._update_com_marker(highlighted)
+        if self.selected_body_id is not None:
+            self._on_solver_body_changed(self.selected_body_id)
 
     def _sync_highlight_transforms(self, body_id: int):
         """Apply the body's current local transform to any active sub-shape highlight
@@ -900,7 +965,10 @@ class MainWindow(QMainWindow):
             # Show local frame if it exists and checkbox is enabled
             if selected_body.local_frame:
                 is_visible = self.property_panel.local_frame_checkbox.isChecked()
-                self.frame_renderer.render_frame(selected_body.local_frame, visible=is_visible)
+                trsf = self._body_ais_local_trsf(selected_body.id)
+                self.frame_renderer.render_frame(
+                    selected_body.local_frame, visible=is_visible, local_trsf=trsf
+                )
 
     def on_com_visibility_changed(self, visible: bool):
         """
@@ -1117,8 +1185,7 @@ class MainWindow(QMainWindow):
         # time, matching face highlights exactly.
         frame = GeometryUtils.frame_from_face(face_props, name=frame_name, unit_scale=self.unit_scale)
 
-        self.created_frames[frame_name] = frame
-        self.frame_to_body_map[frame_name] = body_id
+        self.document.add_frame(frame, body_id, "reference_geometry")
         trsf = self._body_ais_local_trsf(body_id)
         self.frame_renderer.render_frame(frame, visible=True, local_trsf=trsf)
 
@@ -1154,8 +1221,7 @@ class MainWindow(QMainWindow):
 
         frame = GeometryUtils.frame_from_edge(edge_props, name=frame_name, unit_scale=self.unit_scale)
 
-        self.created_frames[frame_name] = frame
-        self.frame_to_body_map[frame_name] = body_id
+        self.document.add_frame(frame, body_id, "reference_geometry")
         trsf = self._body_ais_local_trsf(body_id)
         self.frame_renderer.render_frame(frame, visible=True, local_trsf=trsf)
 
@@ -1187,8 +1253,7 @@ class MainWindow(QMainWindow):
 
         frame = GeometryUtils.frame_from_vertex(vertex_props, name=frame_name)
 
-        self.created_frames[frame_name] = frame
-        self.frame_to_body_map[frame_name] = body_id
+        self.document.add_frame(frame, body_id, "reference_geometry")
         trsf = self._body_ais_local_trsf(body_id)
         self.frame_renderer.render_frame(frame, visible=True, local_trsf=trsf)
 
@@ -1197,6 +1262,30 @@ class MainWindow(QMainWindow):
 
         self.property_panel.show_frame_properties(frame)
         print(f"Created frame '{frame_name}' from vertex {vertex_index} on body {body_id} at {frame.origin}")
+
+    def _rerender_user_frame(self, frame_name: str):
+        """Draw a user frame in its stored coordinates, following its parent body."""
+        frame = self.created_frames.get(frame_name)
+        if frame is None:
+            return
+        body_id = self.frame_to_body_map.get(frame_name)
+        coordinates = self.document.frame_coordinates.get(frame_name, "world")
+        body = self.ground_body if body_id == -1 else self.document.body_by_id(body_id) if body_id is not None else None
+        reference = attachment_reference_frame(frame, body, coordinates)
+        trsf = None if body_id is None or coordinates == "world" else self._body_ais_local_trsf(body_id)
+        self.frame_renderer.render_frame(reference, visible=True, local_trsf=trsf)
+
+    def _available_world_frames(self):
+        """Dialogs consume world coordinates, never mutable reference frames."""
+        frames = [Frame(self.world_frame.origin, self.world_frame.rotation_matrix, self.world_frame.name)]
+        frames.extend(body_world_frame(body) for body in self.bodies if body.local_frame is not None)
+        for name, frame in self.created_frames.items():
+            parent = self.frame_to_body_map.get(name)
+            body = self.ground_body if parent == -1 else self.document.body_by_id(parent) if parent is not None else None
+            frames.append(attachment_world_frame(
+                frame, body, self.document.frame_coordinates.get(name, "world")
+            ))
+        return frames
 
     def _body_ais_local_trsf(self, body_id: int):
         """Return the body's current AIS LocalTransformation (or None)."""
@@ -1208,19 +1297,21 @@ class MainWindow(QMainWindow):
         except Exception:
             return None
 
-    def _sync_body_attached_frames(self, body_id: int):
+    def _sync_body_attached_frames(self, body_id: int, update_viewer: bool = False):
         """Keep user frames parented to a body aligned after pose changes."""
         trsf = self._body_ais_local_trsf(body_id)
         for fname, bid in list(self.frame_to_body_map.items()):
             if bid == body_id and fname in self.created_frames:
+                if self.document.frame_coordinates.get(fname, "world") == "world":
+                    continue
                 try:
-                    self.frame_renderer.update_frame_local_trsf(fname, trsf)
+                    self.frame_renderer.update_frame_local_trsf(
+                        fname, trsf, update_viewer=update_viewer
+                    )
                 except Exception:
                     # Fallback: full re-render
                     try:
-                        self.frame_renderer.render_frame(
-                            self.created_frames[fname], visible=True, local_trsf=trsf
-                        )
+                        self._rerender_user_frame(fname)
                     except Exception as e:
                         print(f"Frame sync failed for {fname}: {e}")
 
@@ -1258,219 +1349,89 @@ class MainWindow(QMainWindow):
         """Handle frame deletion request"""
         print(f"Deleting frame: {frame_name}")
         if frame_name in self.created_frames:
-            # Remove from Renderer
             self.frame_renderer.remove_frame(frame_name)
-            # Remove from storage
-            del self.created_frames[frame_name]
-            # Update tree
+            self.document.delete_frame(frame_name)
             self.body_tree.update_frames(self.created_frames.values())
             # Clear property panel
             self.property_panel.show_no_selection()
     
     def on_body_deleted(self, body_id: int):
-        """Handle body deletion request"""
-        print(f"Deleting body: {body_id}")
-        
-        # Find the body
-        body_to_delete = None
-        for body in self.bodies:
-            if body.id == body_id:
-                body_to_delete = body
-                break
-        
-        if body_to_delete is None:
-            print(f"Body {body_id} not found")
-            return
-        
-        # Show confirmation dialog
-        from PySide6.QtWidgets import QMessageBox
-        reply = QMessageBox.question(
-            self,
-            "Delete Body",
-            f"Are you sure you want to delete '{body_to_delete.name}'?\n\nThis will also delete:\n" +
-            "- Associated frames\n" +
-            "- Joints connected to this body",
-            QMessageBox.Yes | QMessageBox.No,
-            QMessageBox.No
-        )
-        
-        if reply != QMessageBox.Yes:
-            return
-        
-        # Delete joints connected to this body
-        joints_to_delete = []
-        for joint_name, joint in self.joints.items():
-            if joint.body1_id == body_id or joint.body2_id == body_id:
-                joints_to_delete.append(joint_name)
-        
-        for joint_name in joints_to_delete:
-            print(f"  Removing joint: {joint_name}")
-            self.joint_renderer.remove_joint(joint_name)
-            del self.joints[joint_name]
-        
-        # Delete frames associated with this body (using robust dictionary-based tracking)
-        frames_to_delete = [name for name, bid in self.frame_to_body_map.items() if bid == body_id]
-        
-        for frame_name in frames_to_delete:
-            print(f"  Removing frame: {frame_name}")
-            self.frame_renderer.remove_frame(frame_name)
-            del self.created_frames[frame_name]
-            del self.frame_to_body_map[frame_name]  # Clean up association
-        
-        # Remove body's local frame
-        if body_to_delete.local_frame:
-            self.frame_renderer.remove_frame(body_to_delete.local_frame.name)
-        
-        # Remove from renderer
-        self.body_renderer.remove_body(body_id)
-        
-        # Remove from viewer mappings
-        self.viewer_3d.remove_body_from_mapping(body_id)
-        
-        # Remove face and edge properties
-        if body_id in self.face_properties_map:
-            del self.face_properties_map[body_id]
-        if body_id in self.edge_properties_map:
-            del self.edge_properties_map[body_id]
-        
-        # Remove from bodies list
-        self.bodies = [b for b in self.bodies if b.id != body_id]
-        
-        # Prune pose from the mutable State (if present)
-        if self.assembly_state is not None:
-            self.assembly_state.remove_body_pose(body_id)
-        
-        # Clear selection if this was the selected body
-        if self.selected_body_id == body_id:
-            self.selected_body_id = None
-            self.viewer_3d.selected_body_id = None
-            self.property_panel.show_no_selection()
-        
-        # Update GUI
-        self.body_tree.update_bodies(self.bodies)
-        self.body_tree.update_frames(self.created_frames.values())
-        self.body_tree.update_joints_list(self.joints.values())
-        
-        # Update display
-        self.display.Repaint()
-        
-        print(f"Body {body_id} deleted successfully")
-    
+        """Handle body deletion request."""
+        self._delete_bodies([body_id])
+
     def on_multiple_bodies_deleted(self, body_ids: List[int]):
-        """Handle multiple body deletion request"""
-        print(f"Deleting {len(body_ids)} bodies: {body_ids}")
-        
-        # Find all bodies to delete
-        bodies_to_delete = [body for body in self.bodies if body.id in body_ids]
-        
-        if not bodies_to_delete:
+        """Handle multiple body deletion request."""
+        self._delete_bodies(list(body_ids))
+
+    def _delete_bodies(self, body_ids: List[int]):
+        """Remove bodies and every joint, frame, force, and torque that hangs off them."""
+        seen = []
+        for body_id in body_ids:
+            if body_id not in seen:
+                seen.append(body_id)
+        bodies = [body for body in self.bodies if body.id in set(seen)]
+        if not bodies:
             print("No bodies found to delete")
             return
-        
-        # Show confirmation dialog
-        from PySide6.QtWidgets import QMessageBox
-        body_names = "\n".join([f"  - {body.name}" for body in bodies_to_delete])
+        if len(bodies) == 1:
+            title = "Delete Body"
+            message = (
+                f"Are you sure you want to delete '{bodies[0].name}'?\n\n"
+                "This will also delete:\n"
+                "- Associated frames\n"
+                "- Joints connected to this body\n"
+                "- Forces and torques on this body"
+            )
+        else:
+            names = "\n".join(f"  - {body.name}" for body in bodies)
+            title = "Delete Multiple Bodies"
+            message = (
+                f"Are you sure you want to delete {len(bodies)} bodies?\n\n{names}\n\n"
+                "This will also delete:\n"
+                "- Associated frames\n"
+                "- Joints connected to these bodies\n"
+                "- Forces and torques on these bodies"
+            )
         reply = QMessageBox.question(
-            self,
-            "Delete Multiple Bodies",
-            f"Are you sure you want to delete {len(bodies_to_delete)} bodies?\n\n{body_names}\n\nThis will also delete:\n" +
-            "- Associated frames\n" +
-            "- Joints connected to these bodies\n" +
-            "- Forces and torques on these bodies",
-            QMessageBox.Yes | QMessageBox.No,
-            QMessageBox.No
+            self, title, message, QMessageBox.Yes | QMessageBox.No, QMessageBox.No
         )
-        
         if reply != QMessageBox.Yes:
             return
-        
-        # Process each body deletion
-        for body_id in body_ids:
-            body_to_delete = next((b for b in self.bodies if b.id == body_id), None)
-            if not body_to_delete:
-                continue
-            
-            print(f"  Deleting body {body_id}: {body_to_delete.name}")
-            
-            # Delete joints connected to this body
-            joints_to_delete = [joint_name for joint_name, joint in self.joints.items()
-                              if joint.body1_id == body_id or joint.body2_id == body_id]
-            
-            for joint_name in joints_to_delete:
-                print(f"    Removing joint: {joint_name}")
-                self.joint_renderer.remove_joint(joint_name)
-                del self.joints[joint_name]
-            
-            # Delete forces on this body
-            forces_to_delete = [force_name for force_name, force in self.forces.items()
-                               if force.body_id == body_id]
-            
-            for force_name in forces_to_delete:
-                print(f"    Removing force: {force_name}")
-                self.force_renderer.remove_force(force_name)
-                del self.forces[force_name]
-            
-            # Delete torques on this body
-            torques_to_delete = [torque_name for torque_name, torque in self.torques.items()
-                                if torque.body_id == body_id]
-            
-            for torque_name in torques_to_delete:
-                print(f"    Removing torque: {torque_name}")
-                self.torque_renderer.remove_torque(torque_name)
-                del self.torques[torque_name]
-            
-            # Delete frames associated with this body
-            frames_to_delete = [name for name, bid in self.frame_to_body_map.items() if bid == body_id]
-            
-            for frame_name in frames_to_delete:
-                print(f"    Removing frame: {frame_name}")
-                self.frame_renderer.remove_frame(frame_name)
-                del self.created_frames[frame_name]
-                del self.frame_to_body_map[frame_name]
-            
-            # Remove body's local frame
-            if body_to_delete.local_frame:
-                self.frame_renderer.remove_frame(body_to_delete.local_frame.name)
-            
-            # Remove from renderer
+        local_frames = [
+            (body.id, body.local_frame.name)
+            for body in bodies
+            if body.local_frame is not None
+        ]
+        change = self.document.delete_bodies(seen)
+        for name in change.deleted_joints:
+            self.joint_renderer.remove_joint(name)
+        for name in change.deleted_frames:
+            self.frame_renderer.remove_frame(name)
+        for name in change.deleted_forces:
+            self.force_renderer.remove_force(name)
+        for name in change.deleted_torques:
+            self.torque_renderer.remove_torque(name)
+        for body_id, frame_name in local_frames:
+            self.frame_renderer.remove_frame(frame_name)
             self.body_renderer.remove_body(body_id)
-            
-            # Remove from viewer mappings
             self.viewer_3d.remove_body_from_mapping(body_id)
-            
-            # Remove face, edge, and vertex properties
-            if body_id in self.face_properties_map:
-                del self.face_properties_map[body_id]
-            if body_id in self.edge_properties_map:
-                del self.edge_properties_map[body_id]
-            if body_id in self.vertex_properties_map:
-                del self.vertex_properties_map[body_id]
-        
-        # Remove all deleted bodies from the bodies list
-        self.bodies = [b for b in self.bodies if b.id not in body_ids]
-        
-        # Prune poses from the mutable State
-        if self.assembly_state is not None:
-            for bid in body_ids:
-                self.assembly_state.remove_body_pose(bid)
-        
-        # Clear selection if any deleted body was selected
-        if self.selected_body_id in body_ids:
+            self.face_properties_map.pop(body_id, None)
+            self.edge_properties_map.pop(body_id, None)
+            self.vertex_properties_map.pop(body_id, None)
+        if self.selected_body_id in set(change.deleted_body_ids):
             self.selected_body_id = None
             self.viewer_3d.selected_body_id = None
             self.property_panel.show_no_selection()
-        
-        # Update GUI
         self.body_tree.update_bodies(self.bodies)
         self.body_tree.update_frames(self.created_frames.values())
         self.body_tree.update_joints_list(self.joints.values())
         self.body_tree.update_forces_list(self.forces.values())
         self.body_tree.update_torques_list(self.torques.values())
-        
-        # Update display
+        if self.controller.coordinator is not None:
+            self.controller.coordinator.forget(change.deleted_body_ids)
+        self.controller.on_topology_changed()
         self.display.Repaint()
-        
-        print(f"Successfully deleted {len(body_ids)} bodies")
+        print(f"Deleted bodies: {change.deleted_body_ids}")
             
     def on_frame_position_changed(self, frame_name: str, position: Tuple[float, float, float]):
         """Handle manual frame position update"""
@@ -1479,8 +1440,7 @@ class MainWindow(QMainWindow):
             frame = self.created_frames[frame_name]
             # Update frame object
             frame.origin = np.array(position)
-            # Re-render in viewer
-            self.frame_renderer.render_frame(frame, visible=True)
+            self._rerender_user_frame(frame_name)
 
     def on_frame_rotation_changed(self, frame_name: str, angles: Tuple[float, float, float]):
         """Handle manual frame rotation update"""
@@ -1489,8 +1449,7 @@ class MainWindow(QMainWindow):
             frame = self.created_frames[frame_name]
             # Update frame object
             frame.set_rotation_from_euler(np.array(angles))
-            # Re-render in viewer
-            self.frame_renderer.render_frame(frame, visible=True)
+            self._rerender_user_frame(frame_name)
             # Update axis display in property panel (avoids full reload to keep focus, 
             # but show_frame_properties blocks signals so it is safe)
             self.property_panel.show_frame_properties(frame)
@@ -1568,49 +1527,124 @@ class MainWindow(QMainWindow):
              return
 
         # Gather all available frames
-        available_frames = [self.world_frame]
-        for body in self.bodies: # Don't re-add Ground's frame if it is world frame
-            if body.local_frame:
-                available_frames.append(body.local_frame)
-        available_frames.extend(self.created_frames.values())
+        frame_options = {
+            int(body.id): self._joint_frames_for_body(int(body.id))
+            for body in all_bodies
+        }
+        if any(not options for options in frame_options.values()):
+            QMessageBox.information(
+                self, "Joint Frames Needed",
+                "Each body needs an available frame. Create a frame on the intended "
+                "face, edge, or vertex, then create the joint.",
+            )
+            return
 
-        # Open Dialog
-        dialog = JointCreationDialog(all_bodies, available_frames, self)
-        if dialog.exec():
-            name, j_type, b1_id, b2_id, frame, axis = dialog.get_data()
-            
-            # Validation
-            if not name:
-                QMessageBox.warning(self, "Invalid Name", "Joint name cannot be empty.")
-                return
-            if name in self.joints:
-                QMessageBox.warning(self, "Duplicate Name", f"Joint '{name}' already exists.")
-                return
-            if b1_id == b2_id:
-                QMessageBox.warning(self, "Invalid Bodies", "Cannot create joint between the same body.")
-                return
+        dialog = JointCreationDialog(all_bodies, frame_options, self)
+        dialog.preview_changed.connect(self._preview_joint_frames)
+        try:
+            accepted = dialog.exec()
+        finally:
+            self.joint_renderer.clear_preview()
+        if not accepted:
+            return
 
-            # Create Joint (with single frame)
-            joint = Joint(name, j_type, b1_id, b2_id, frame, axis)
+        request = dialog.get_data()
+        name = request["name"]
+        if name in self.joints:
+            QMessageBox.warning(self, "Duplicate Name", f"Joint '{name}' already exists.")
+            return
+        bodies_by_id = {-1: self.ground_body, **{int(body.id): body for body in self.bodies}}
+        try:
+            joint = make_joint(
+                name=name,
+                joint_type=request["joint_type"],
+                body1_id=request["body1_id"],
+                body2_id=request["body2_id"],
+                frame1=request["frame1"],
+                frame2=request["frame2"],
+                body1=bodies_by_id.get(int(request["body1_id"])),
+                body2=bodies_by_id.get(int(request["body2_id"])),
+                pose1=self._body_pose_tuple(int(request["body1_id"])),
+                pose2=self._body_pose_tuple(int(request["body2_id"])),
+                axis1=request["axis1"],
+                axis2=request["axis2"],
+                flip1=request["flip1"],
+                flip2=request["flip2"],
+            )
+        except (TypeError, ValueError) as error:
+            QMessageBox.warning(self, "Invalid Joint Frames", str(error))
+            return
 
-            # Capture body-local markers so the joint moves with its bodies
-            # and the kinematic solver can constrain it (SolveSpace-style).
-            try:
-                p1 = self._body_pose_tuple(b1_id)
-                p2 = self._body_pose_tuple(b2_id)
-                capture_joint_markers(joint, p1, p2)
-            except Exception as e:
-                print(f"Warning: failed to capture joint markers for '{name}': {e}")
+        self.document.add_joint(joint)
+        self.controller.on_topology_changed()
+        self.body_tree.update_joints_list(self.joints.values())
+        self.joint_renderer.render_joint(
+            joint, bodies=self.bodies, ground_body=self.ground_body
+        )
+        print(f"Created joint: {joint}")
+        if request["assemble"]:
+            self.controller.solve_assembly(
+                require_feasible=True,
+                reference_body_id=request["reference_body_id"],
+            )
 
-            self.joints[name] = joint
-            
-            print(f"Created joint: {joint}")
-            
-            # Update Tree
-            self.body_tree.update_joints_list(self.joints.values())
-            
-            # Render Joint
-            self.joint_renderer.render_joint(joint)
+    def _joint_frames_for_body(self, body_id: int):
+        """List only frames owned by this joint endpoint's body."""
+        if int(body_id) == -1:
+            options = [JointFrameOption(
+                self.world_frame.name, -1,
+                Frame(self.world_frame.origin.copy(), self.world_frame.rotation_matrix.copy(), self.world_frame.name),
+                "world",
+            )]
+        else:
+            body = self.document.body_by_id(body_id)
+            if body is None:
+                return []
+            options = []
+            if body.local_frame is not None:
+                options.append(JointFrameOption(
+                    body.local_frame.name, body_id, body.local_frame, "reference_geometry"
+                ))
+        for name, parent_id in self.frame_to_body_map.items():
+            if int(parent_id) == int(body_id) and name in self.created_frames:
+                options.append(JointFrameOption(
+                    name, int(body_id), self.created_frames[name],
+                    self.document.frame_coordinates.get(name, "world"),
+                ))
+        # Tree and labels are name based, so present one option for duplicate aliases.
+        unique = {}
+        for option in options:
+            unique.setdefault(option.key, option)
+        return list(unique.values())
+
+    def _preview_joint_frames(self, frame1, frame2):
+        """Show both currently selected frames while the joint dialog is open."""
+        if frame1 is None or frame2 is None:
+            self.joint_renderer.clear_preview()
+            return
+        body_by_id = {-1: self.ground_body, **{int(body.id): body for body in self.bodies}}
+        try:
+            world1 = self._resolve_joint_preview_frame(frame1, body_by_id.get(frame1.owner_body_id))
+            world2 = self._resolve_joint_preview_frame(frame2, body_by_id.get(frame2.owner_body_id))
+            dialog = self.sender()
+            if dialog is not None:
+                request = dialog.get_data()
+                if request["joint_type"] in AXIAL_JOINTS:
+                    world1.rotation_matrix = world1.rotation_matrix @ axis_alignment(request["axis1"])
+                    world2.rotation_matrix = world2.rotation_matrix @ axis_alignment(request["axis2"])
+                flip_rotation = np.diag([1.0, -1.0, -1.0])
+                if request["flip1"]:
+                    world1.rotation_matrix = world1.rotation_matrix @ flip_rotation
+                if request["flip2"]:
+                    world2.rotation_matrix = world2.rotation_matrix @ flip_rotation
+            self.joint_renderer.preview_attachments(world1, world2)
+        except (TypeError, ValueError, AttributeError):
+            self.joint_renderer.clear_preview()
+
+    def _resolve_joint_preview_frame(self, option, body):
+        from core.joint_factory import resolve_frame
+        pose = self._body_pose_tuple(option.owner_body_id)
+        return resolve_frame(option, body, ground_pose=pose)
             
     def _body_pose_tuple(self, body_id: int):
         """Return (origin, rotation_matrix) for a body (or ground) in world coords."""
@@ -1630,92 +1664,9 @@ class MainWindow(QMainWindow):
             return body.local_frame.origin.copy(), body.local_frame.rotation_matrix.copy()
         return np.zeros(3), np.eye(3)
 
-    def _make_kinematic_solver(self) -> KinematicSolver:
-        """Build a KinematicSolver over the current assembly State/joints."""
-        if self.assembly_state is None:
-            raise RuntimeError("No assembly state — load a STEP file first.")
-        # Ensure every joint has markers (legacy joints / project load).
-        for joint in self.joints.values():
-            if joint.marker1 is None or joint.marker2 is None:
-                try:
-                    capture_joint_markers(
-                        joint,
-                        self._body_pose_tuple(joint.body1_id),
-                        self._body_pose_tuple(joint.body2_id),
-                    )
-                except Exception as e:
-                    print(f"Warning: could not capture markers for joint '{joint.name}': {e}")
-
-        return KinematicSolver(
-            bodies=self.bodies,
-            joints=list(self.joints.values()),
-            state=self.assembly_state,
-            ground_id=-1,
-            ground_pose=self._body_pose_tuple(-1),
-        )
-
     def solve_assembly(self):
-        """Snap all body poses so joint constraints are satisfied (Ctrl+K)."""
-        if not self.bodies:
-            QMessageBox.warning(self, "No Bodies", "Load a STEP file before solving.")
-            return
-        if not self.joints:
-            QMessageBox.information(self, "No Joints", "Create joints before solving the assembly.")
-            return
-        if self.assembly_state is None:
-            QMessageBox.warning(self, "No State", "Assembly state is not initialized.")
-            return
-
-        try:
-            solver = self._make_kinematic_solver()
-            report = solver.solve_assembly(max_iters=80, tol=1e-9, analyze=True)
-        except Exception as e:
-            import traceback
-            traceback.print_exc()
-            QMessageBox.critical(self, "Solve Error", f"Kinematic solve failed:\n{e}")
-            return
-
-        # Apply visuals for every body
-        for body in self.bodies:
-            self.body_renderer.update_body_transform(body.id)
-            self._sync_highlight_transforms(body.id)
-            self._sync_body_attached_frames(body.id)
-            pose = self.assembly_state.get_body_pose(body.id)
-            if pose is not None and body.local_frame is not None:
-                body.local_frame.origin = pose.origin.copy()
-                body.local_frame.rotation_matrix = pose.rotation_matrix.copy()
-
-        # Refresh joint visuals (frames are still world-defined at creation;
-        # markers drive the solver — joint display may lag slightly until
-        # joint_renderer is updated to draw marker frames).
-        for joint in self.joints.values():
-            self.joint_renderer.render_joint(joint)
-
-        self.display.Context.UpdateCurrentViewer()
-        self.display.Repaint()
-
-        # Status / feedback
-        residual_lines = [
-            f"  {name}: {res:.3e}"
-            for name, res in sorted(report.per_joint_residual.items())
-        ]
-        residual_txt = "\n".join(residual_lines) if residual_lines else "  (none)"
-        red = ", ".join(report.redundant_joints) if report.redundant_joints else "none"
-        msg = (
-            f"{'Converged' if report.converged else 'Did not fully converge'}\n"
-            f"Iterations: {report.iterations}\n"
-            f"Max residual: {report.max_residual:.3e}\n"
-            f"Estimated DOF: {report.dof}\n"
-            f"Redundant joints: {red}\n\n"
-            f"Per-joint residual norms:\n{residual_txt}"
-        )
-        print(f"Solve Assembly: {msg}")
-        self.statusBar().showMessage(
-            f"Solve {'OK' if report.converged else 'partial'} | "
-            f"DOF={report.dof} | max res={report.max_residual:.2e}",
-            8000,
-        )
-        QMessageBox.information(self, "Solve Assembly", msg)
+        """Snap body poses so joint constraints are satisfied (Ctrl+K)."""
+        self.controller.solve_assembly()
             
     def on_joint_selected(self, joint_name: str):
         """Handle joint selection in tree"""
@@ -1743,13 +1694,9 @@ class MainWindow(QMainWindow):
             )
             
             if reply == QMessageBox.Yes:
-                # Remove visualization
                 self.joint_renderer.remove_joint(joint_name)
-                
-                # Remove from storage
-                del self.joints[joint_name]
-                
-                # Update tree
+                self.document.delete_joint(joint_name)
+                self.controller.on_topology_changed()
                 self.body_tree.update_joints_list(self.joints.values())
                 
                 # Clear property panel if this joint was selected
@@ -1864,11 +1811,7 @@ class MainWindow(QMainWindow):
         all_bodies = [self.ground_body] + self.bodies
         
         # Gather all available frames
-        available_frames = [self.world_frame]
-        for body in self.bodies:
-            if body.local_frame:
-                available_frames.append(body.local_frame)
-        available_frames.extend(self.created_frames.values())
+        available_frames = self._available_world_frames()
         
         # Open Dialog (pre-select current body if any)
         dialog = ForceDialog(all_bodies, available_frames, self.selected_body_id, self)
@@ -1890,7 +1833,7 @@ class MainWindow(QMainWindow):
             # Create Force
             try:
                 force = Force(name, body_id, frame, magnitude, direction)
-                self.forces[name] = force
+                self.document.add_force(force)
                 
                 print(f"Created force: {force}")
                 
@@ -1927,13 +1870,8 @@ class MainWindow(QMainWindow):
             )
             
             if reply == QMessageBox.Yes:
-                # Remove visualization
                 self.force_renderer.remove_force(force_name)
-                
-                # Remove from storage
-                del self.forces[force_name]
-                
-                # Update tree
+                self.document.delete_force(force_name)
                 self.body_tree.update_forces_list(self.forces.values())
                 
                 # Clear property panel
@@ -1951,11 +1889,7 @@ class MainWindow(QMainWindow):
         all_bodies = [self.ground_body] + self.bodies
         
         # Gather all available frames
-        available_frames = [self.world_frame]
-        for body in self.bodies:
-            if body.local_frame:
-                available_frames.append(body.local_frame)
-        available_frames.extend(self.created_frames.values())
+        available_frames = self._available_world_frames()
         
         # Open Dialog (pre-select current body if any)
         dialog = TorqueDialog(all_bodies, available_frames, self.selected_body_id, self)
@@ -1977,7 +1911,7 @@ class MainWindow(QMainWindow):
             # Create Torque
             try:
                 torque = Torque(name, body_id, frame, magnitude, axis)
-                self.torques[name] = torque
+                self.document.add_torque(torque)
                 
                 print(f"Created torque: {torque}")
                 
@@ -2014,13 +1948,8 @@ class MainWindow(QMainWindow):
             )
             
             if reply == QMessageBox.Yes:
-                # Remove visualization
                 self.torque_renderer.remove_torque(torque_name)
-                
-                # Remove from storage
-                del self.torques[torque_name]
-                
-                # Update tree
+                self.document.delete_torque(torque_name)
                 self.body_tree.update_torques_list(self.torques.values())
                 
                 # Clear property panel
@@ -2154,208 +2083,107 @@ class MainWindow(QMainWindow):
                 )
     
     def save_project(self):
-        """Save the current project (STEP file path, frames, joints) to a .mbdp file"""
+        """Save poses, markers, attachments, and loads with the CAD identity."""
         if not self.current_step_file:
             QMessageBox.warning(self, "No STEP File", "Please load a STEP file before saving a project.")
             return
-        
-        # Ask user for save location
         filepath, _ = QFileDialog.getSaveFileName(
             self,
             "Save Project",
             "",
             "MBD Project Files (*.mbdp);;JSON Files (*.json);;All Files (*.*)"
         )
-        
         if not filepath:
             print("Project save cancelled by user")
             return
-        
         try:
-            import json
-            import os
-            
-            # Prepare project data
-            project_data = {
-                "version": "1.0",
-                "step_file": os.path.abspath(self.current_step_file),
-                "unit_scale": self.unit_scale,
-                "frames": [],
-                "joints": []
-            }
-            
-            # Serialize created frames
-            for frame_name, frame in self.created_frames.items():
-                frame_data = {
-                    "name": frame.name,
-                    "origin": frame.origin.tolist(),
-                    "rotation_matrix": frame.rotation_matrix.tolist()
-                }
-                project_data["frames"].append(frame_data)
-            
-            # Serialize joints
-            for joint_name, joint in self.joints.items():
-                joint_data = {
-                    "name": joint.name,
-                    "type": joint.joint_type.name,
-                    "body1_id": joint.body1_id,
-                    "body2_id": joint.body2_id,
-                    "frame_name": joint.frame.name,
-                    "frame_origin": joint.frame.origin.tolist(),
-                    "frame_rotation": joint.frame.rotation_matrix.tolist(),
-                    "axis": joint.axis
-                }
-                project_data["joints"].append(joint_data)
-            
-            # Write to file
-            with open(filepath, 'w') as f:
-                json.dump(project_data, f, indent=2)
-            
+            write_project_file(filepath, self.document, self.current_step_file)
             print(f"Project saved to: {filepath}")
-            print(f"  - {len(project_data['frames'])} frames")
-            print(f"  - {len(project_data['joints'])} joints")
-            
             QMessageBox.information(
                 self,
                 "Project Saved",
-                f"Project saved successfully!\n\nFrames: {len(project_data['frames'])}\nJoints: {len(project_data['joints'])}"
+                "Project saved successfully.\n\n"
+                f"Bodies: {len(self.bodies)}\n"
+                f"Joints: {len(self.joints)}\n"
+                f"Frames: {len(self.created_frames)}"
             )
-            
         except Exception as e:
             QMessageBox.critical(self, "Save Error", f"Failed to save project:\n{str(e)}")
             print(f"Error saving project: {e}")
-    
+
     def load_project(self):
-        """Load a project from a .mbdp file"""
+        """Read a project, then import its CAD. The open document stays if this fails."""
         filepath, _ = QFileDialog.getOpenFileName(
             self,
             "Load Project",
             "",
             "MBD Project Files (*.mbdp);;JSON Files (*.json);;All Files (*.*)"
         )
-        
         if not filepath:
             print("Project load cancelled by user")
             return
-        
         try:
-            import json
-            import os
-            
-            # Read project file
-            with open(filepath, 'r') as f:
-                project_data = json.load(f)
-            
-            print(f"Loading project from: {filepath}")
-            
-            # Verify version
-            if project_data.get("version") != "1.0":
-                QMessageBox.warning(self, "Version Mismatch", "This project was created with a different version.")
-            
-            # Load the STEP file first
-            step_file = project_data.get("step_file")
-            if not step_file or not os.path.exists(step_file):
-                # Try relative path
-                project_dir = os.path.dirname(filepath)
-                step_filename = os.path.basename(step_file) if step_file else ""
-                step_file = os.path.join(project_dir, step_filename)
-                
-                if not os.path.exists(step_file):
-                    QMessageBox.critical(
-                        self,
-                        "STEP File Not Found",
-                        f"Cannot find STEP file:\n{project_data.get('step_file')}\n\nPlease locate it manually."
-                    )
-                    # Ask user to locate the STEP file
-                    step_file, _ = QFileDialog.getOpenFileName(
-                        self,
-                        "Locate STEP File",
-                        project_dir,
-                        "STEP Files (*.step *.stp);;All Files (*.*)"
-                    )
-                    if not step_file:
-                        return
-            
-            # Load the STEP file
-            self.load_step_file(step_file)
-            
-            # Restore frames
-            frames_data = project_data.get("frames", [])
-            for frame_data in frames_data:
-                frame = Frame(
-                    name=frame_data["name"],
-                    origin=np.array(frame_data["origin"]),
-                    rotation_matrix=np.array(frame_data["rotation_matrix"])
-                )
-                self.created_frames[frame.name] = frame
-                self.frame_renderer.render_frame(frame, visible=True)
-            
-            # Update frame tree
-            self.body_tree.update_frames(self.created_frames.values())
-            
-            # Restore joints
-            joints_data = project_data.get("joints", [])
-            for joint_data in joints_data:
-                # Recreate frame for the joint
-                frame = Frame(
-                    name=joint_data["frame_name"],
-                    origin=np.array(joint_data["frame_origin"]),
-                    rotation_matrix=np.array(joint_data["frame_rotation"])
-                )
-                
-                # Recreate joint
-                joint = Joint(
-                    name=joint_data["name"],
-                    joint_type=JointType[joint_data["type"]],
-                    body1_id=joint_data["body1_id"],
-                    body2_id=joint_data["body2_id"],
-                    frame=frame,
-                    axis=joint_data.get("axis", "+Z")
-                )
-
-                # Capture markers if state is already available (STEP load may still be async)
-                if self.assembly_state is not None:
-                    try:
-                        capture_joint_markers(
-                            joint,
-                            self._body_pose_tuple(joint.body1_id),
-                            self._body_pose_tuple(joint.body2_id),
-                        )
-                    except Exception as e:
-                        print(f"Warning: marker capture deferred for '{joint.name}': {e}")
-                
-                self.joints[joint.name] = joint
-                self.joint_renderer.render_joint(joint)
-            
-            # Update joints tree
-            self.body_tree.update_joints_list(self.joints.values())
-            
-            print(f"Project loaded successfully!")
-            print(f"  - {len(frames_data)} frames restored")
-            print(f"  - {len(joints_data)} joints restored")
-            
-            QMessageBox.information(
+            loaded = read_project(filepath)
+        except ProjectValidationError as exc:
+            QMessageBox.critical(self, "Invalid Project File", str(exc))
+            print(f"Error parsing project file: {exc}")
+            return
+        step_file = resolve_step_file(filepath, loaded)
+        if step_file is None:
+            QMessageBox.critical(
                 self,
-                "Project Loaded",
-                f"Project loaded successfully!\n\nFrames: {len(frames_data)}\nJoints: {len(joints_data)}"
+                "STEP File Not Found",
+                f"Cannot find STEP file:\n{loaded.step_file}\n\nPlease locate it manually."
             )
-            
-        except json.JSONDecodeError as e:
-            QMessageBox.critical(self, "Invalid Project File", f"Failed to parse project file:\n{str(e)}")
-            print(f"Error parsing project file: {e}")
-        except Exception as e:
-            QMessageBox.critical(self, "Load Error", f"Failed to load project:\n{str(e)}")
-            print(f"Error loading project: {e}")
-            import traceback
-            traceback.print_exc()
+            project_dir = os.path.dirname(filepath)
+            step_file, _ = QFileDialog.getOpenFileName(
+                self,
+                "Locate STEP File",
+                project_dir,
+                "STEP Files (*.step *.stp);;All Files (*.*)"
+            )
+            if not step_file:
+                return
+            loaded.step_file = step_file
+        print(f"Loading project from: {filepath}")
+        self._start_import(step_file, loaded)
+
+
+def _require_jax():
+    """JAX evaluates the kinematic residual. There is no other solver."""
+    try:
+        import jax  # noqa: F401
+        import jaxlib  # noqa: F401
+    except ImportError as exc:
+        raise SystemExit(
+            "JAX is required to run MBD-PreProcessor and is not installed.\n"
+            "Install it in this environment with: pip install jax==0.6.2\n"
+            f"Details: {exc}"
+        )
 
 
 def main():
     """Application entry point"""
-    app = QApplication(sys.argv)
+    _require_jax()
+    import argparse
+    parser = argparse.ArgumentParser(description="Multi-Body Dynamics Preprocessor")
+    parser.add_argument("--enable-mcp", action="store_true", help="Enable local application control")
+    parser.add_argument("--control-socket", default="mbd-preprocessor", help="Local control socket name")
+    options, qt_args = parser.parse_known_args()
+    app = QApplication([sys.argv[0], *qt_args])
     
     # Create and show main window
     window = MainWindow()
+    if options.enable_mcp:
+        from gui.control_bridge import ApplicationControlBridge
+        try:
+            window.control_bridge = ApplicationControlBridge(window, options.control_socket)
+        except Exception:
+            window.controller.scheduler.shutdown_finished.connect(app.quit)
+            window.controller.shutdown()
+            if not window.controller.scheduler.is_stopped:
+                app.exec()
+            raise
     window.show()
     
     # Start the event loop

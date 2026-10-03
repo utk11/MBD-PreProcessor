@@ -20,49 +20,11 @@ import numpy as np
 # Make repo root importable when run as a script.
 sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), "..")))
 
-from core.data_structures import Frame, Joint, JointType, RigidBody, State
+from core.data_structures import Joint, JointType
 from core.kinematics import KinematicSolver, capture_joint_markers
 from core.kinematics import markers as M
 from core.kinematics.constraints import JointConstraint
-
-
-GROUND_POSE = (np.zeros(3), np.eye(3))
-TOL = 1e-6
-
-
-def make_body(body_id, origin, R=None):
-    b = RigidBody(body_id, None, name=f"Body_{body_id}")
-    b.center_of_mass = np.asarray(origin, dtype=float)
-    b.local_frame = Frame(origin=np.asarray(origin, dtype=float),
-                          rotation_matrix=(R if R is not None else np.eye(3)),
-                          name=f"Body_{body_id}_frame")
-    return b
-
-
-def make_state(bodies):
-    st = State()
-    for b in bodies:
-        R = b.local_frame.rotation_matrix if b.local_frame else np.eye(3)
-        st.set_body_pose(b.id, b.local_frame.origin, R)
-        b.state = st
-    return st
-
-
-def Rz(deg):
-    t = np.radians(deg)
-    c, s = np.cos(t), np.sin(t)
-    return np.array([[c, -s, 0.0], [s, c, 0.0], [0.0, 0.0, 1.0]])
-
-
-def joint_world_frame(origin, R=None):
-    return Frame(origin=np.asarray(origin, dtype=float),
-                 rotation_matrix=(R if R is not None else np.eye(3)),
-                 name="J")
-
-
-def pose_of(state, body_id):
-    p = state.get_body_pose(body_id)
-    return p.origin, p.rotation_matrix
+from kinematics_fixtures import GROUND_POSE, Rz, joint_world_frame, make_body, make_state, pose_of
 
 
 def test_pendulum():

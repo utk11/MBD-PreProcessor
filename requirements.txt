@@ -8,8 +8,13 @@ PySide6==6.10.1
 # Numerical computing
 numpy==2.2.6
 
-# Scientific computing (convex hull generation)
+# Scientific computing (convex hull generation, sparse linear prototypes)
 scipy==1.15.3
+
+# Required kinematic evaluator. There is no NumPy-solver fallback.
+# 0.6.2 is the newest JAX release that installs on Python 3.10.
+# jax==0.11.2 requires Python 3.12, which this pythonocc environment does not use.
+jax==0.6.2
 
 # Mesh operations
 trimesh==4.11.0

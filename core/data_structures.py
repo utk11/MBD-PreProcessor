@@ -133,6 +133,13 @@ class Joint:
         # core.kinematics.markers.capture_marker(). None until then.
         self.marker1: Optional[Frame] = None
         self.marker2: Optional[Frame] = None
+        # Optional provenance for joints made from independently selected frames.
+        self.marker1_source: Optional[str] = None
+        self.marker2_source: Optional[str] = None
+        self.marker1_axis: Optional[str] = None
+        self.marker2_axis: Optional[str] = None
+        self.marker1_flip: bool = False
+        self.marker2_flip: bool = False
         
         # Motor properties (add-on for revolute and prismatic joints)
         self.is_motorized: bool = False

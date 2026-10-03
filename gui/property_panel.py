@@ -291,7 +291,8 @@ class PropertyPanel(QWidget):
         self.joint_axis_label = QLabel("—")
         self.joint_body1_label = QLabel("—")
         self.joint_body2_label = QLabel("—")
-        self.joint_frame_label = QLabel("—")
+        self.joint_frame1_label = QLabel("—")
+        self.joint_frame2_label = QLabel("—")
         
         # Motor properties
         self.joint_motorized_label = QLabel("—")
@@ -303,7 +304,8 @@ class PropertyPanel(QWidget):
         joint_layout.addRow("Axis:", self.joint_axis_label)
         joint_layout.addRow("Body 1:", self.joint_body1_label)
         joint_layout.addRow("Body 2:", self.joint_body2_label)
-        joint_layout.addRow("Joint Frame:", self.joint_frame_label)
+        joint_layout.addRow("Body 1 Attachment:", self.joint_frame1_label)
+        joint_layout.addRow("Body 2 Attachment:", self.joint_frame2_label)
         
         # Add separator for motor section
         separator_motor = QFrame()
@@ -521,14 +523,33 @@ class PropertyPanel(QWidget):
         self.joint_name_label.setText(joint.name)
         self.joint_type_label.setText(joint.joint_type.name)
         
-        if joint.axis:
+        if joint.marker1_axis or joint.marker2_axis:
+            axis1 = joint.marker1_axis or "—"
+            axis2 = joint.marker2_axis or "—"
+            axis1 += " (flipped)" if joint.marker1_flip else ""
+            axis2 += " (flipped)" if joint.marker2_flip else ""
+            self.joint_axis_label.setText(
+                f"Body 1 {axis1} / Body 2 {axis2}"
+            )
+        elif joint.marker1_flip or joint.marker2_flip:
+            flip1 = " (flipped)" if joint.marker1_flip else ""
+            flip2 = " (flipped)" if joint.marker2_flip else ""
+            self.joint_axis_label.setText(
+                f"Body 1 orientation{flip1} / Body 2 orientation{flip2}"
+            )
+        elif joint.axis:
             self.joint_axis_label.setText(joint.axis)
         else:
             self.joint_axis_label.setText("—")
             
         self.joint_body1_label.setText(str(joint.body1_id))
         self.joint_body2_label.setText(str(joint.body2_id))
-        self.joint_frame_label.setText(joint.frame.name)
+        self.joint_frame1_label.setText(
+            joint.marker1_source or (joint.marker1.name if joint.marker1 is not None else joint.frame.name)
+        )
+        self.joint_frame2_label.setText(
+            joint.marker2_source or (joint.marker2.name if joint.marker2 is not None else joint.frame.name)
+        )
         
         # Update motor properties
         if joint.is_motorized:

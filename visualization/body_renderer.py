@@ -45,12 +45,13 @@ class BodyRenderer:
         """
         self.unit_scale = scale
     
-    def display_bodies(self, bodies: list[RigidBody]):
+    def display_bodies(self, bodies: list[RigidBody], base_poses=None):
         """
         Display all bodies in the viewer
         
         Args:
             bodies: List of RigidBody objects to display
+            base_poses: Imported CAD poses, before restoring saved placement.
         """
         # Clear previous AIS shapes
         self.body_ais_shapes.clear()
@@ -81,21 +82,23 @@ class BodyRenderer:
             self.body_ais_shapes[body.id] = ais_shape
             self.bodies_dict[body.id] = body
         
-        # Update display
-        self.display.Context.UpdateCurrentViewer()
-        print(f"All {len(bodies)} bodies displayed and activated for selection")
-
         # Record base poses (from State if present, otherwise from local_frame) so we can apply deltas later
         self._base_poses.clear()
         for body in bodies:
             if body.shape is None:
                 continue
-            base_pose = self._get_current_body_pose(body)
+            imported = None if base_poses is None else base_poses.get(body.id)
+            base_pose = Pose(*imported) if imported is not None else self._get_current_body_pose(body)
             if base_pose is not None:
                 self._base_poses[body.id] = base_pose
-            # For first display we intentionally do NOT apply a local transform.
-            # The geometry is already at the "base" location. Transforms are applied as deltas
-            # when the State pose changes (see update_body_transform).
+            # Saved placement needs a delta from the imported CAD pose.
+            # A fresh import is already at its baseline location.
+            if imported is not None:
+                self.update_body_transform(body.id)
+            if not body.visible:
+                self.display.Context.Erase(self.body_ais_shapes[body.id], False)
+        self.display.Context.UpdateCurrentViewer()
+        print(f"All {len(bodies)} bodies displayed and activated for selection")
         
     def highlight_body(self, body_id: int):
         """

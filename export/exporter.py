@@ -2,9 +2,9 @@
 Assembly Export Module
 Exports assembly data to JSON and body meshes to OBJ format
 
-All coordinates are in global world frame.
-Note: Since this is a preprocessor (not a simulator), all frames are stored 
-in world coordinates and exported directly without transformation.
+Live body placement is ``world_pose``. ``local_frame`` is the reference
+center-of-mass frame from import, not the pose after a drag or solve.
+Mesh vertices are written in that reference frame.
 """
 
 import json
@@ -20,6 +20,8 @@ from OCC.Core.BRep import BRep_Tool
 from OCC.Core.gp import gp_Pnt
 
 from core.data_structures import RigidBody, Joint, Frame
+from core.kinematics.markers import marker_world
+from core.transforms import body_world_pose, reference_pose
 
 
 class AssemblyExporter:
@@ -124,12 +126,17 @@ class AssemblyExporter:
     
     @staticmethod
     def _serialize_body(body: RigidBody, mesh_uri: Optional[str] = None) -> Dict:
-        """Serialize a rigid body to dictionary (all coordinates in world frame)"""
+        """Serialize a rigid body. ``world_pose`` is live; ``local_frame`` is the reference."""
+        world_origin, world_rotation = body_world_pose(body)
         body_data = {
             "id": body.id,
             "name": body.name,
             "volume": float(body.volume) if body.volume else 0.0,
             "contact_enabled": body.contact_enabled,
+            "world_pose": {
+                "origin": [float(x) for x in world_origin],
+                "rotation_matrix": [[float(x) for x in row] for row in world_rotation],
+            },
         }
 
         if mesh_uri:
@@ -153,9 +160,15 @@ class AssemblyExporter:
                 [0.0, 0.0, 0.0]
             ]
         
-        # Local frame (in world frame coordinates)
+        # Reference COM frame recorded at import. Drag and solve do not rewrite it.
+        ref_origin, ref_rotation = reference_pose(body)
         if body.local_frame is not None:
-            body_data["local_frame"] = AssemblyExporter._serialize_frame(body.local_frame)
+            reference = Frame(
+                origin=ref_origin,
+                rotation_matrix=ref_rotation,
+                name=body.local_frame.name,
+            )
+            body_data["local_frame"] = AssemblyExporter._serialize_frame(reference)
         else:
             body_data["local_frame"] = None
         
@@ -221,11 +234,28 @@ class AssemblyExporter:
         else:
             joint_data["motorized"] = False
         
-        # Frame is already stored in world coordinates (this is a preprocessor, bodies don't move)
-        # No transformation needed - just serialize it directly
+        # Creation frame, kept as stored. Marker frames follow the live body poses.
         joint_data["frame_world"] = AssemblyExporter._serialize_frame(joint.frame) if joint.frame else None
+        joint_data["marker1_local"] = AssemblyExporter._serialize_frame(joint.marker1) if joint.marker1 else None
+        joint_data["marker2_local"] = AssemblyExporter._serialize_frame(joint.marker2) if joint.marker2 else None
+        joint_data["marker1_source"] = joint.marker1_source
+        joint_data["marker2_source"] = joint.marker2_source
+        joint_data["marker1_axis"] = joint.marker1_axis
+        joint_data["marker2_axis"] = joint.marker2_axis
+        joint_data["marker1_flip"] = bool(joint.marker1_flip)
+        joint_data["marker2_flip"] = bool(joint.marker2_flip)
+        joint_data["marker1_world"] = AssemblyExporter._marker_world_record(joint.marker1, body1)
+        joint_data["marker2_world"] = AssemblyExporter._marker_world_record(joint.marker2, body2)
         
         return joint_data
+
+    @staticmethod
+    def _marker_world_record(marker, body):
+        if marker is None or body is None:
+            return None
+        origin, rotation = body_world_pose(body)
+        world = marker_world(marker, origin, rotation)
+        return AssemblyExporter._serialize_frame(world)
     
     @staticmethod
     def _get_mesh_filename(body: RigidBody) -> str:
@@ -340,12 +370,11 @@ class AssemblyExporter:
                         # Get coordinates in world frame and scale to meters
                         world_coords = np.array([pnt.X() * scale_factor, pnt.Y() * scale_factor, pnt.Z() * scale_factor])
                         
-                        # Transform to body's local frame (COM-centered) if body is provided
-                        if body and body.local_frame:
-                            # Translate to COM-centered coordinates
-                            translated = world_coords - np.array(body.center_of_mass)
-                            # Rotate to local frame (inverse rotation = transpose)
-                            local_coords = body.local_frame.rotation_matrix.T @ translated
+                        # Mesh vertices stay in the reference frame, not the live pose.
+                        if body is not None:
+                            ref_origin, ref_rotation = reference_pose(body)
+                            translated = world_coords - ref_origin
+                            local_coords = ref_rotation.T @ translated
                             coords = tuple(local_coords)
                         else:
                             coords = tuple(world_coords)

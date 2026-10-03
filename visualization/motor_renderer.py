@@ -11,6 +11,8 @@ from OCC.Core.Geom import Geom_Line
 from OCC.Core.Graphic3d import Graphic3d_NOM_PLASTIC
 from OCC.Display.OCCViewer import Viewer3d
 from core.data_structures import Joint, MotorType, JointType, RigidBody
+from core.kinematics.markers import axis_vector, marker_world
+from core.transforms import body_world_pose
 from typing import List
 import numpy as np
 
@@ -50,31 +52,20 @@ class MotorRenderer:
         if joint.name in self.motor_shapes:
             self.remove_motor(joint.name)
         
-        # Get joint location (use frame1 in world coordinates)
+        # Use the live first attachment; it follows Body 1 after assembly or a drag.
         body1 = ground_body if joint.body1_id == -1 else next((b for b in bodies if b.id == joint.body1_id), None)
         
-        if not body1 or not joint.frame1:
+        if not body1 or joint.marker1 is None:
             print(f"Warning: Cannot render motor for joint {joint.name} - missing body or frame")
             return
         
-        # Transform frame1 to world coordinates
-        if body1.local_frame and joint.body1_id != -1:
-            world_origin = body1.local_frame.origin + body1.local_frame.rotation_matrix @ joint.frame1.origin
-            world_rotation = body1.local_frame.rotation_matrix @ joint.frame1.rotation_matrix
-        else:
-            world_origin = joint.frame1.origin
-            world_rotation = joint.frame1.rotation_matrix
+        body_origin, body_rotation = body_world_pose(body1)
+        world_frame = marker_world(joint.marker1, body_origin, body_rotation)
+        world_origin = world_frame.origin
+        world_rotation = world_frame.rotation_matrix
         
         # Get joint axis in world coordinates
-        axis_map = {
-            "+X": np.array([1, 0, 0]),
-            "-X": np.array([-1, 0, 0]),
-            "+Y": np.array([0, 1, 0]),
-            "-Y": np.array([0, -1, 0]),
-            "+Z": np.array([0, 0, 1]),
-            "-Z": np.array([0, 0, -1])
-        }
-        local_axis = axis_map.get(joint.axis, np.array([0, 0, 1]))
+        local_axis = axis_vector(joint.axis)
         world_axis = world_rotation @ local_axis
         
         # Create motor visualization based on type

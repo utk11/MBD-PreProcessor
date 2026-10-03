@@ -1,370 +1,520 @@
-"""Damped least-squares kinematic assembly solver.
+"""JAX-backed kinematic assembly session.
 
-Solves body 6DOF poses so that all joint constraints are satisfied, using a
-Levenberg-Marquardt style damped Newton loop over stacked per-joint residuals
-with analytic Jacobians (see core/kinematics/constraints.py).
+One ``KinematicSolver`` is one session: prepared arrays, workspace, and the
+compiled evaluator. Dragging and Solve Assembly both use this session. The
+iteration loop is the shared NumPy engine. Constraint evaluation is JAX.
 
-Design (the "SolveSpace copy"):
-  * Full-Cartesian body-6DOF coordinates; ground contributes no unknowns.
-  * Optional *pinning* of a dragged body: the dragged body's pose is a soft,
-    high-weight constraint (its desired pose), so the solver balances the
-    user's intent against the joint constraints.
-  * Group decomposition via JointGraph: only the connected component(s) that
-    need solving are solved.
-  * After solving, per-joint residual norms, an estimate of redundant
-    constraints, and the mechanism mobility (DOF) are reported from the
-    assembled Jacobian.
-
-Poses are read from / written to a ``State`` object, so the existing renderer
-(``update_body_transform``) picks up solved poses unchanged.
-
-Pure numpy; no GUI / OCC imports.
+``solve_assembly`` and ``solve_drag`` read the attached ``State`` and, when
+that state exists, commit finite poses back into it. That keeps headless tests
+on the historical call shape. The GUI worker uses ``solve_request`` instead,
+which reads an owned pose snapshot and does not write the live document.
 """
 
 from __future__ import annotations
 
-from dataclasses import dataclass, field
-from typing import Dict, List, Optional, Tuple
+import os
+from dataclasses import dataclass, replace
+from typing import Dict, Iterable, List, Optional, Sequence, Tuple
 
 import numpy as np
 
-from core.data_structures import Joint, Pose, State
-from core.kinematics import markers as M
-from core.kinematics.constraints import JointConstraint, CONSTRAINT_COUNT
-from core.kinematics.graph import JointGraph
+from core.data_structures import Joint, State
+from core.kinematics.backends import get_evaluator
+from core.kinematics.engine import (
+    diagnose_model,
+    poses_finite,
+    snapshot_state,
+    solve_assembly as _solve_assembly,
+    solve_drag as _solve_drag,
+)
+from core.kinematics.linear_sparse import make_linear_strategy
+from core.kinematics.prepared import (
+    FORMULATION_COMPAT,
+    GROUPING_COMPATIBILITY,
+    constant_signature,
+    prepare,
+    refresh_constants,
+    structural_signature,
+)
+from core.kinematics.reports import RevisionStamp, SolveReport, apply_stamp, commit_poses
+from core.kinematics.trace import PhaseTrace, SolveOptions
+from core.kinematics.workspace import ensure_workspace, validate_workspace
 
 
 @dataclass
-class SolveReport:
-    """Outcome of a solve."""
-    converged: bool
-    iterations: int
-    final_residual_norm: float
-    max_residual: float
-    per_joint_residual: Dict[str, float] = field(default_factory=dict)
-    moved_bodies: List[int] = field(default_factory=list)
-    redundant_joints: List[str] = field(default_factory=list)
-    dof: Optional[int] = None
-    message: str = ""
+class SolveRequest:
+    """Owned numerical inputs for one worker request."""
+
+    kind: str
+    bodies: list
+    joints: list
+    poses: Dict[int, Tuple[np.ndarray, np.ndarray]]
+    ground_pose: Tuple[np.ndarray, np.ndarray]
+    stamp: RevisionStamp
+    dragged_body_id: Optional[int] = None
+    target_origin: Optional[np.ndarray] = None
+    target_rotation: Optional[np.ndarray] = None
+    max_iters: int = 30
+    tol: float = 1e-8
+    pin_weight: float = 1.0
+    pin_orientation: bool = False
+    analyze: bool = False
+    locked_body_ids: Tuple[int, ...] = ()
 
 
 class KinematicSolver:
-    """Position-level assembly solver over a body/joint graph."""
+    """Persistent JAX session over the shared Levenberg-Marquardt engine."""
 
-    def __init__(self,
-                 bodies,                      # iterable of RigidBody (need .id)
-                 joints: List[Joint],
-                 state: State,
-                 ground_id: int = -1,
-                 ground_pose: Optional[Tuple[np.ndarray, np.ndarray]] = None,
-                 locked_body_ids: Optional[List[int]] = None):
+    def __init__(
+        self,
+        bodies,
+        joints: Sequence[Joint],
+        state: Optional[State] = None,
+        ground_id: int = -1,
+        ground_pose: Optional[Tuple[np.ndarray, np.ndarray]] = None,
+        locked_body_ids: Optional[Iterable[int]] = None,
+        formulation_version: str = FORMULATION_COMPAT,
+        grouping: str = GROUPING_COMPATIBILITY,
+        diagnostics: str = "policy",
+        linear_solver: str = "dense",
+    ):
+        if diagnostics not in ("policy", "compat", "off"):
+            raise ValueError("diagnostics must be 'policy', 'compat', or 'off'.")
+        self.bodies = bodies if isinstance(bodies, list) else list(bodies)
+        self.joints = joints if isinstance(joints, list) else list(joints)
         self.state = state
-        self.joints = list(joints)
-        self.ground_id = ground_id
-        self.ground_pose = ground_pose if ground_pose is not None else (
-            np.zeros(3), np.eye(3))
-        self.locked_body_ids = set(locked_body_ids or [])
-        self.locked_body_ids.add(ground_id)
+        self.ground_id = int(ground_id)
+        self.ground_pose = ground_pose if ground_pose is not None else (np.zeros(3), np.eye(3))
+        self.locked_body_ids = set(int(b) for b in (locked_body_ids or []))
+        self.locked_body_ids.add(self.ground_id)
+        self.formulation_version = formulation_version
+        self.grouping = grouping
+        self.diagnostics = diagnostics
+        self.linear_solver_name = linear_solver
+        self.linear_strategy = make_linear_strategy(linear_solver)
+        self._model = None
+        self._workspace = None
+        self._topology_revision = None
+        self._marker_revision = None
+        self.evaluator = get_evaluator("jax")
 
-        self.body_ids = [b.id for b in bodies]
-        self.graph = JointGraph(self.body_ids, self.joints, ground_id=ground_id)
+    def _ensure_workspace(self, model):
+        self._workspace = ensure_workspace(
+            self._workspace, model,
+            dense_linear=not getattr(self.linear_strategy, "uses_blocks", False),
+        )
+        return self._workspace
 
-    # ------------------------------------------------------------------
-    # Pose access
-    # ------------------------------------------------------------------
-    def _get_pose(self, body_id: int) -> Tuple[np.ndarray, np.ndarray]:
-        pose = self.state.get_body_pose(body_id)
-        if pose is None:
-            return np.zeros(3), np.eye(3)
-        return pose.origin.copy(), pose.rotation_matrix.copy()
+    def release(self) -> None:
+        """Drop this session's prepared data and compiled-function references."""
+        self._model = None
+        self._workspace = None
+        self._topology_revision = None
+        self._marker_revision = None
+        release = getattr(self.evaluator, "release", None)
+        if release is not None:
+            release()
 
-    def _set_pose(self, body_id: int, origin: np.ndarray, R: np.ndarray):
-        self.state.set_body_pose(body_id, np.asarray(origin, float),
-                                 M.project_to_so3(np.asarray(R, float)))
+    def invalidate(self, category: str) -> None:
+        """Drop cached preparation for topology, marker, or pose changes."""
+        key = category.strip().lower()
+        if key in ("topology", "structure", "locks", "bodies", "joints"):
+            self._model = None
+            self._workspace = None
+            self._topology_revision = None
+            self._marker_revision = None
+        elif key in ("constants", "markers", "axes"):
+            if self._model is not None:
+                self._model = replace(self._model, constant_signature="invalid")
+            self._marker_revision = None
+        elif key in ("poses", "state"):
+            pass
+        else:
+            raise ValueError(
+                f"Unknown invalidation category {category!r}. "
+                "Use 'topology', 'constants', or 'poses'."
+            )
 
-    # ------------------------------------------------------------------
-    # Assembly of the nonlinear system for a set of joints / movable bodies
-    # ------------------------------------------------------------------
-    def _build(self, joints: List[Joint], movable: List[int]):
-        """Return (constraints, residual_fn, jacobian_fn, col_index)."""
-        col_index: Dict[int, int] = {bid: 6 * i for i, bid in enumerate(movable)}
-        ncols = 6 * len(movable)
+    def prewarm(self) -> None:
+        """Compile both evaluator kernels before a timed drag."""
+        trace = PhaseTrace(enabled=False)
+        model = self._ensure_model(trace, None)
+        self._ensure_workspace(model)
+        self._load_start(model, self._workspace, None)
+        self.evaluator.prewarm(model, self._workspace.origin, self._workspace.rotation)
 
-        constraints = [
-            JointConstraint(j, self._get_pose,
-                            ground_id=self.ground_id,
-                            ground_pose=self.ground_pose)
-            for j in joints
-        ]
+    def solve_assembly(
+        self,
+        max_iters: int = 50,
+        tol: float = 1e-9,
+        analyze: Optional[bool] = None,
+        trace: bool = False,
+        stamp: Optional[RevisionStamp] = None,
+        commit: Optional[bool] = None,
+    ) -> SolveReport:
+        do_analyze = self._wants_analysis(analyze, drag=False)
+        options = SolveOptions(
+            max_iters=max_iters,
+            tol=tol,
+            pin_weight=0.0,
+            pin_orientation=True,
+            joint_weight=1e3,
+            analyze=do_analyze,
+            trace=trace,
+            strategy=self.linear_strategy,
+        )
+        return self._run(options, drag=None, stamp=stamp, commit=commit, pose_map=None)
 
-        def residual_fn() -> np.ndarray:
-            return np.concatenate([c.residual() for c in constraints]) \
-                if constraints else np.zeros(0)
+    def solve_drag(
+        self,
+        dragged_body_id: int,
+        target_origin: np.ndarray,
+        target_R: Optional[np.ndarray] = None,
+        pin_weight: float = 100.0,
+        max_iters: int = 30,
+        tol: float = 1e-8,
+        pin_orientation: bool = False,
+        trace: bool = False,
+        analyze: Optional[bool] = None,
+        stamp: Optional[RevisionStamp] = None,
+        commit: Optional[bool] = None,
+    ) -> SolveReport:
+        if target_R is None:
+            target_R = self._current_rotation(int(dragged_body_id))
+        do_analyze = self._wants_analysis(analyze, drag=True)
+        options = SolveOptions(
+            max_iters=max_iters,
+            tol=tol,
+            pin_weight=pin_weight,
+            pin_orientation=pin_orientation,
+            joint_weight=1e3,
+            analyze=do_analyze,
+            trace=trace,
+            strategy=self.linear_strategy,
+        )
+        drag = (
+            int(dragged_body_id),
+            np.asarray(target_origin, dtype=np.float64),
+            np.asarray(target_R, dtype=np.float64),
+        )
+        return self._run(options, drag=drag, stamp=stamp, commit=commit, pose_map=None)
 
-        def jacobian_fn() -> np.ndarray:
-            if not constraints:
-                return np.zeros((0, ncols))
-            rows = []
-            for c in constraints:
-                Jc, mov = c.jacobian()
-                Jr = np.zeros((Jc.shape[0], ncols))
-                for k, bid in enumerate(mov):
-                    if bid in col_index:
-                        Jr[:, col_index[bid]:col_index[bid] + 6] = Jc[:, 6 * k:6 * k + 6]
-                rows.append(Jr)
-            return np.vstack(rows) if rows else np.zeros((0, ncols))
-
-        return constraints, residual_fn, jacobian_fn, col_index
-
-    # ------------------------------------------------------------------
-    # LM solve on one component
-    # ------------------------------------------------------------------
-    def _solve_lm(self,
-                  joints: List[Joint],
-                  movable: List[int],
-                  pin_body_id: Optional[int],
-                  pin_target: Optional[Tuple[np.ndarray, np.ndarray]],
-                  pin_weight: float,
-                  max_iters: int,
-                  tol: float,
-                  pin_orientation: bool = True,
-                  joint_weight: float = 1e3) -> SolveReport:
-        constraints, residual_fn, jacobian_fn, col_index = self._build(joints, movable)
-
-        pin_rows = 0
-        if pin_body_id is not None and pin_body_id in col_index and pin_target is not None:
-            pin_rows = 6 if pin_orientation else 3
-
-        lam = 1e-3
-        report = SolveReport(converged=False, iterations=0,
-                             final_residual_norm=np.inf, max_residual=np.inf)
-
-        def full_residual():
-            # Joints are "hard" (high weight); pin is soft.
-            r = residual_fn() * joint_weight
-            if pin_rows and pin_target is not None and pin_body_id is not None:
-                o_t, R_t = pin_target
-                o_c, R_c = self._get_pose(pin_body_id)
-                sw = np.sqrt(pin_weight)
-                if pin_orientation:
-                    r_pin = np.concatenate([
-                        o_c - o_t,
-                        M.relative_rotation_vector(R_c, R_t),
-                    ]) * sw
-                else:
-                    r_pin = (o_c - o_t) * sw
-                r = np.concatenate([r, r_pin])
-            return r
-
-        def full_jacobian():
-            J = jacobian_fn() * joint_weight
-            if pin_rows and pin_target is not None and pin_body_id is not None:
-                sw = np.sqrt(pin_weight)
-                c0 = col_index[pin_body_id]
-                if pin_orientation:
-                    J_pin = np.zeros((6, J.shape[1]))
-                    J_pin[0:3, c0:c0 + 3] = np.eye(3) * sw
-                    J_pin[3:6, c0 + 3:c0 + 6] = -np.eye(3) * sw
-                else:
-                    J_pin = np.zeros((3, J.shape[1]))
-                    J_pin[0:3, c0:c0 + 3] = np.eye(3) * sw
-                J = np.vstack([J, J_pin])
-            return J
-
-        for it in range(max_iters):
-            r = full_residual()
-            J = full_jacobian()
-
-            r_joints = residual_fn()
-            jnorm = float(np.linalg.norm(r_joints)) if r_joints.size else 0.0
-            jmax = float(np.max(np.abs(r_joints))) if r_joints.size else 0.0
-            report.iterations = it + 1
-            report.final_residual_norm = jnorm
-            report.max_residual = jmax
-
-            if J.shape[1] == 0:
-                report.converged = (jmax < tol)
-                break
-
-            # Damped normal equations: (J^T J + lam * diag(J^T J)) d = -J^T r
-            JTJ = J.T @ J
-            g = J.T @ r
-            diag = np.diag(JTJ).copy()
-            diag[diag < 1e-12] = 1e-12
+    def solve_request(self, request: SolveRequest) -> SolveReport:
+        """Solve from an owned snapshot. Does not write a live ``State``."""
+        self.bodies = list(request.bodies)
+        self.joints = list(request.joints)
+        self.ground_pose = (
+            np.array(request.ground_pose[0], dtype=np.float64, copy=True),
+            np.array(request.ground_pose[1], dtype=np.float64, copy=True),
+        )
+        self.locked_body_ids = set(int(b) for b in request.locked_body_ids)
+        self.locked_body_ids.add(self.ground_id)
+        kind = request.kind
+        if kind == "prewarm":
+            trace = PhaseTrace(enabled=False)
             try:
-                delta = np.linalg.solve(JTJ + lam * np.diag(diag), -g)
-            except np.linalg.LinAlgError:
-                delta = np.linalg.lstsq(JTJ + lam * np.diag(diag), -g,
-                                        rcond=None)[0]
+                model = self._ensure_model(trace, request.stamp)
+                self._ensure_workspace(model)
+                self._load_start(model, self._workspace, request.poses)
+                self.evaluator.prewarm(model, self._workspace.origin, self._workspace.rotation)
+            except ValueError as exc:
+                return self._invalid(f"Invalid model: {exc}", request.stamp, trace)
+            report = SolveReport(True, 0, 0.0, 0.0, message="Prepared", finite=True, trace=trace)
+            apply_stamp(report, request.stamp)
+            self._copy_compile_stats(trace)
+            return report
+        if kind == "diagnose":
+            return self._diagnose(request)
+        if kind == "assembly":
+            return self._run(
+                SolveOptions(
+                    max_iters=request.max_iters,
+                    tol=request.tol,
+                    pin_weight=0.0,
+                    pin_orientation=True,
+                    joint_weight=1e3,
+                    analyze=True,
+                    trace=False,
+                    strategy=self.linear_strategy,
+                ),
+                drag=None,
+                stamp=request.stamp,
+                commit=False,
+                pose_map=request.poses,
+            )
+        analyze = bool(request.analyze)
+        return self._run(
+            SolveOptions(
+                max_iters=request.max_iters,
+                tol=request.tol,
+                pin_weight=request.pin_weight,
+                pin_orientation=request.pin_orientation,
+                joint_weight=1e3,
+                analyze=analyze,
+                trace=False,
+                strategy=self.linear_strategy,
+            ),
+            drag=(
+                int(request.dragged_body_id),
+                np.asarray(request.target_origin, dtype=np.float64),
+                np.asarray(request.target_rotation, dtype=np.float64),
+            ),
+            stamp=request.stamp,
+            commit=False,
+            pose_map=request.poses,
+        )
 
-            step_norm = float(np.linalg.norm(delta))
-            # Stop when joints are satisfied and the step is tiny.
-            # (With an active pin the joints may already be zero at the start of
-            # a drag, so we must not exit before taking a pin-driven step.)
-            if jmax < tol and step_norm < max(tol, 1e-10):
-                report.converged = True
-                break
+    def _wants_analysis(self, override: Optional[bool], drag: bool) -> bool:
+        if override is not None:
+            return bool(override)
+        if self.diagnostics == "off":
+            return False
+        # Interactive dragging skips rank analysis. Assembly and an explicit
+        # final diagnostic request turn it back on.
+        if drag:
+            return False
+        return True
 
-            # Trial apply.
-            old_poses = {bid: self._get_pose(bid) for bid in movable}
-            for bid in movable:
-                c0 = col_index[bid]
-                o, R = old_poses[bid]
-                no, nR = M.apply_increment(o, R, delta[c0:c0 + 6])
-                self._set_pose(bid, no, nR)
+    def _current_rotation(self, body_id: int) -> np.ndarray:
+        if self.state is not None:
+            pose = self.state.get_body_pose(body_id)
+            if pose is not None:
+                return np.array(pose.rotation_matrix, dtype=np.float64, copy=True)
+        return np.eye(3)
 
-            new_norm = float(np.linalg.norm(full_residual()))
-            old_norm = float(np.linalg.norm(r))
-            if new_norm < old_norm * (1.0 + 1e-8):
-                lam = max(lam * 0.5, 1e-9)
+    def _ground_pose_arrays(self) -> Tuple[np.ndarray, np.ndarray]:
+        origin, rotation = self.ground_pose
+        return (
+            np.asarray(origin, dtype=np.float64),
+            np.asarray(rotation, dtype=np.float64),
+        )
+
+    def _ensure_model(self, trace: PhaseTrace, stamp: Optional[RevisionStamp]):
+        use_revisions = stamp is not None and stamp.use_revisions
+        if use_revisions:
+            if self._model is None or stamp.topology_revision != self._topology_revision:
+                trace.stale_model = self._model is not None
+                self._model = self._prepare()
+                self._workspace = None
+                self._topology_revision = stamp.topology_revision
+                self._marker_revision = stamp.marker_revision
+            elif stamp.marker_revision != self._marker_revision:
+                trace.stale_model = True
+                self._model = refresh_constants(self._model, self.joints)
+                self._marker_revision = stamp.marker_revision
+            self._assert_revisions(stamp)
+            return self._model
+
+        struct = structural_signature(
+            [int(b.id) for b in self.bodies],
+            self.joints,
+            self.locked_body_ids,
+            self.ground_id,
+            self.formulation_version,
+            self.grouping,
+        )
+        const = constant_signature(
+            [int(b.id) for b in self.bodies],
+            self.joints,
+            self.locked_body_ids,
+            self.ground_id,
+            self.formulation_version,
+            self.grouping,
+        )
+        if self._model is None or struct != self._model.structural_signature:
+            if self._model is not None:
+                trace.stale_model = True
+            self._model = self._prepare()
+            self._workspace = None
+        elif const != self._model.constant_signature:
+            trace.stale_model = True
+            self._model = refresh_constants(self._model, self.joints)
+        return self._model
+
+    def _prepare(self):
+        return prepare(
+            self.bodies,
+            self.joints,
+            self.locked_body_ids,
+            ground_id=self.ground_id,
+            formulation_version=self.formulation_version,
+            grouping=self.grouping,
+            revision=1,
+        )
+
+    def _assert_revisions(self, stamp: RevisionStamp) -> None:
+        if os.environ.get("MBD_ASSERT_SIGNATURES") != "1" or self._model is None:
+            return
+        struct = structural_signature(
+            [int(b.id) for b in self.bodies],
+            self.joints,
+            self.locked_body_ids,
+            self.ground_id,
+            self.formulation_version,
+            self.grouping,
+        )
+        if struct != self._model.structural_signature:
+            raise AssertionError(
+                "Topology changed without a topology revision. "
+                f"request={stamp.topology_revision}"
+            )
+
+    def _load_start(self, model, workspace, pose_map) -> None:
+        if pose_map is None and self.state is not None:
+            snapshot_state(self.state, model, workspace, self._ground_pose_arrays())
+            return
+        ground_origin, ground_rotation = self._ground_pose_arrays()
+        workspace.origin[0] = ground_origin
+        workspace.rotation[0] = ground_rotation
+        eye = np.eye(3)
+        poses = pose_map or {}
+        for body_id in model.body_ids:
+            slot = model.slot_of[int(body_id)]
+            pair = poses.get(int(body_id))
+            if pair is None and self.state is not None:
+                pose = self.state.get_body_pose(int(body_id))
+                if pose is not None:
+                    pair = (pose.origin, pose.rotation_matrix)
+            if pair is None:
+                workspace.origin[slot] = 0.0
+                workspace.rotation[slot] = eye
             else:
-                for bid in movable:
-                    o, R = old_poses[bid]
-                    self._set_pose(bid, o, R)
-                lam = min(lam * 4.0, 1e6)
+                workspace.origin[slot] = np.asarray(pair[0], dtype=np.float64)
+                workspace.rotation[slot] = np.asarray(pair[1], dtype=np.float64)
+        np.copyto(workspace.trial_origin, workspace.origin)
+        np.copyto(workspace.trial_rotation, workspace.rotation)
 
-        # Final residual snapshot (joint constraints only — not pin).
-        r_final = residual_fn()
-        report.final_residual_norm = float(np.linalg.norm(r_final)) if r_final.size else 0.0
-        report.max_residual = float(np.max(np.abs(r_final))) if r_final.size else 0.0
-        report.converged = report.converged or (report.max_residual < max(tol * 10, 1e-6))
+    def _copy_poses(self, body_ids: Sequence[int]) -> Dict[int, Tuple[np.ndarray, np.ndarray]]:
+        poses = {}
+        for body_id in body_ids:
+            body_id = int(body_id)
+            slot = self._model.slot_of[body_id]
+            poses[body_id] = (
+                np.array(self._workspace.origin[slot], dtype=np.float64, copy=True),
+                np.array(self._workspace.rotation[slot], dtype=np.float64, copy=True),
+            )
+        return poses
 
-        for c in constraints:
-            rc = c.residual()
-            report.per_joint_residual[c.joint.name] = float(np.linalg.norm(rc))
+    def _copy_compile_stats(self, trace: PhaseTrace) -> None:
+        trace.compile_count = int(getattr(self.evaluator, "compile_count", 0))
+        trace.compile_s = float(getattr(self.evaluator, "compile_s", 0.0))
+        trace.backend = getattr(self.evaluator, "name", "jax")
+        trace.device = getattr(self.evaluator, "device", "cpu")
 
-        report.moved_bodies = list(movable)
+    def _finish(
+        self,
+        report: SolveReport,
+        trace: PhaseTrace,
+        moved: Sequence[int],
+        finite: bool,
+        stamp: Optional[RevisionStamp],
+        commit: Optional[bool],
+        materialize_before: float,
+    ) -> SolveReport:
+        report.finite = bool(finite)
+        report.trace = trace
+        report.joint_feasible = bool(trace.joint_feasible) if finite else False
+        report.target_error = trace.pin_error
+        apply_stamp(report, stamp)
+        self._copy_compile_stats(trace)
+        if trace.enabled:
+            trace.add_time(
+                "materialize",
+                float(getattr(self.evaluator, "materialize_s", 0.0)) - materialize_before,
+            )
+        if not finite or self._model is None or self._workspace is None:
+            report.poses = {}
+            report.finite = False
+            report.converged = False
+            if not report.message:
+                report.message = "Numerical failure"
+            return report
+        if not poses_finite(self._workspace, moved, self._model):
+            report.poses = {}
+            report.finite = False
+            report.converged = False
+            report.message = "Numerical failure"
+            trace.numerical_failure = True
+            return report
+        report.poses = self._copy_poses(moved)
+        report.moved_bodies = list(report.poses.keys())
+        do_commit = (self.state is not None) if commit is None else bool(commit)
+        if do_commit and self.state is not None:
+            commit_poses(self.state, report)
         return report
 
-    # ------------------------------------------------------------------
-    # Redundancy / DOF analysis on the assembled Jacobian
-    # ------------------------------------------------------------------
-    def _analyze(self, joints: List[Joint], movable: List[int],
-                 tol: float = 1e-8) -> Tuple[List[str], Optional[int]]:
-        if not movable:
-            return [], 0
-        _, residual_fn, jacobian_fn, _ = self._build(joints, movable)
-        J = jacobian_fn()
-        if J.size == 0:
-            return [], 6 * len(movable)
-        sv = np.linalg.svd(J, compute_uv=False)
-        rank = int(np.sum(sv > max(tol, sv[0] * 1e-8 if sv.size else 0.0)))
-        n_eq = J.shape[0]
-        n_unknown = J.shape[1]
+    def _invalid(self, message: str, stamp: Optional[RevisionStamp], trace: PhaseTrace) -> SolveReport:
+        report = SolveReport(
+            converged=False,
+            iterations=0,
+            final_residual_norm=float("inf"),
+            max_residual=float("inf"),
+            message=message,
+            finite=False,
+            trace=trace,
+        )
+        apply_stamp(report, stamp)
+        self._copy_compile_stats(trace)
+        return report
 
-        # Redundant joints: a joint is flagged if removing its rows does NOT
-        # decrease the Jacobian rank (its rows were linearly dependent on the
-        # rest).  Trigger whenever we have more equations than independent ones.
-        redundant: List[str] = []
-        if n_eq > rank:
-            names = [j.name for j in joints]
-            counts = [CONSTRAINT_COUNT[j.joint_type] for j in joints]
-            # Row-slice per joint and test rank drop on removal.
-            start = 0
-            for name, cnt in zip(names, counts):
-                idx = list(range(0, start)) + list(range(start + cnt, n_eq))
-                if idx:
-                    Jred = J[idx, :]
-                    sv2 = np.linalg.svd(Jred, compute_uv=False)
-                    thr = max(tol, (sv2[0] * 1e-8 if sv2.size else 0.0))
-                    rank2 = int(np.sum(sv2 > thr))
-                else:
-                    rank2 = 0
-                if rank2 == rank:
-                    redundant.append(name)
-                start += cnt
+    def _run(
+        self,
+        options: SolveOptions,
+        drag: Optional[tuple],
+        stamp: Optional[RevisionStamp],
+        commit: Optional[bool],
+        pose_map,
+    ) -> SolveReport:
+        trace = PhaseTrace(enabled=options.trace)
+        materialize_before = float(getattr(self.evaluator, "materialize_s", 0.0))
+        try:
+            with trace.phase("prepare"):
+                model = self._ensure_model(trace, stamp)
+                self._ensure_workspace(model)
+                validate_workspace(self._workspace)
+        except ValueError as exc:
+            return self._invalid(f"Invalid model: {exc}", stamp, trace)
+        with trace.phase("snapshot"):
+            self._load_start(model, self._workspace, pose_map)
+        if drag is None:
+            result = _solve_assembly(self.evaluator, model, self._workspace, options, trace)
+        else:
+            body_id, target_origin, target_rotation = drag
+            result = _solve_drag(
+                self.evaluator, model, self._workspace, options,
+                body_id, target_origin, target_rotation, trace,
+            )
+        return self._finish(
+            result.report, result.trace, result.moved_body_ids, result.finite,
+            stamp, commit, materialize_before,
+        )
 
-        dof = max(0, n_unknown - rank)
-        return redundant, dof
-
-    # ------------------------------------------------------------------
-    # Public entry points
-    # ------------------------------------------------------------------
-    def solve_assembly(self,
-                       max_iters: int = 50,
-                       tol: float = 1e-9,
-                       analyze: bool = True) -> SolveReport:
-        """Solve all components to satisfy all joints (the 'snap' command)."""
-        movable_all = [b for b in self.body_ids if b not in self.locked_body_ids]
-        if not self.joints:
-            return SolveReport(True, 0, 0.0, 0.0, message="No joints to solve.")
-
-        # Solve each connected component independently.
-        overall = SolveReport(True, 0, 0.0, 0.0)
-        seen: set = set()
-        for comp in self.graph.components():
-            comp_bodies = [b for b in comp
-                           if b in self.body_ids and b not in self.locked_body_ids]
-            comp_joints = [j for j in self.joints
-                           if j.body1_id in comp and j.body2_id in comp]
-            if not comp_joints:
-                continue
-            key = tuple(sorted(comp))
-            if key in seen:
-                continue
-            seen.add(key)
-
-            rep = self._solve_lm(comp_joints, comp_bodies,
-                                 pin_body_id=None, pin_target=None,
-                                 pin_weight=0.0,
-                                 max_iters=max_iters, tol=tol,
-                                 pin_orientation=True)
-            overall.iterations += rep.iterations
-            overall.converged = overall.converged and rep.converged
-            overall.per_joint_residual.update(rep.per_joint_residual)
-            overall.moved_bodies.extend(rep.moved_bodies)
-            overall.final_residual_norm = max(overall.final_residual_norm,
-                                              rep.final_residual_norm)
-            overall.max_residual = max(overall.max_residual, rep.max_residual)
-
-        if analyze:
-            red, dof = self._analyze(self.joints, movable_all)
-            overall.redundant_joints = red
-            overall.dof = dof
-
-        overall.message = ("Converged" if overall.converged else "Did not fully converge")
-        return overall
-
-    def solve_drag(self,
-                   dragged_body_id: int,
-                   target_origin: np.ndarray,
-                   target_R: Optional[np.ndarray] = None,
-                   pin_weight: float = 100.0,
-                   max_iters: int = 30,
-                   tol: float = 1e-8,
-                   pin_orientation: bool = False) -> SolveReport:
-        """Solve the dragged body's component with the dragged body pinned to a target.
-
-        Only the connected component containing ``dragged_body_id`` is solved;
-        unrelated bodies are untouched.
-
-        By default only the *position* is pinned (``pin_orientation=False``),
-        matching mouse-drag translation. Pass ``pin_orientation=True`` to also
-        soft-constrain orientation.
-        """
-        comp = self.graph.component_of(dragged_body_id)
-        comp_joints = [j for j in self.joints
-                       if j.body1_id in comp and j.body2_id in comp]
-        movable = [b for b in comp
-                   if b in self.body_ids and b not in self.locked_body_ids]
-
-        if not comp_joints or not movable:
-            return SolveReport(True, 0, 0.0, 0.0,
-                               message="Dragged body is not joint-constrained.")
-
-        if target_R is None:
-            _, target_R = self._get_pose(dragged_body_id)
-
-        rep = self._solve_lm(comp_joints, movable,
-                             pin_body_id=dragged_body_id,
-                             pin_target=(np.asarray(target_origin, float),
-                                         np.asarray(target_R, float)),
-                             pin_weight=pin_weight,
-                             max_iters=max_iters, tol=tol,
-                             pin_orientation=pin_orientation)
-
-        red, dof = self._analyze(comp_joints, movable)
-        rep.redundant_joints = red
-        rep.dof = dof
-        rep.message = "Converged" if rep.converged else "Did not fully converge"
-        return rep
+    def _diagnose(self, request: SolveRequest) -> SolveReport:
+        trace = PhaseTrace(enabled=False)
+        materialize_before = float(getattr(self.evaluator, "materialize_s", 0.0))
+        try:
+            with trace.phase("prepare"):
+                model = self._ensure_model(trace, request.stamp)
+                self._ensure_workspace(model)
+                validate_workspace(self._workspace)
+        except ValueError as exc:
+            return self._invalid(f"Invalid model: {exc}", request.stamp, trace)
+        with trace.phase("snapshot"):
+            self._load_start(model, self._workspace, request.poses)
+        options = SolveOptions(
+            max_iters=0,
+            tol=request.tol,
+            analyze=True,
+            trace=False,
+            strategy=self.linear_strategy,
+        )
+        result = diagnose_model(self.evaluator, model, self._workspace, options, trace)
+        report = self._finish(
+            result.report, result.trace, [], result.finite,
+            request.stamp, False, materialize_before,
+        )
+        # Diagnostics describe the pose they were given. They do not move it.
+        report.poses = {}
+        report.moved_bodies = []
+        report.kind = "diagnose"
+        return report

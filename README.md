@@ -37,15 +37,21 @@ https://www.linkedin.com/posts/utkarsh-kulkarni-737a21143_python-mbd-simulation-
 
 2. Create a conda environment and install pythonocc-core:
    ```bash
-   conda create -n mbd python=3.10
-   conda activate mbd
+   conda create -n mbd_preproc python=3.10
+   conda activate mbd_preproc
    conda install -c conda-forge pythonocc-core
    ```
 
-3. Install remaining dependencies:
+3. Install remaining dependencies, including JAX:
    ```bash
    pip install -r requirements.txt
    ```
+
+   JAX evaluates joint residuals and Jacobians. This environment is Python 3.10,
+   so the pin is `jax==0.6.2` (`jax==0.11.2` requires Python 3.12). The app
+   exits with an install message if JAX is missing. It does not fall back to
+   another solver. The Levenberg-Marquardt loop and the dense linear step stay
+   in NumPy.
 
 ## Usage
 
@@ -58,12 +64,13 @@ python main.py
 
 1. **File → Open STEP**: Load a CAD assembly file
 2. **Select bodies** in the left panel tree view
-3. **Create joints** via Edit → Create Joint:
-   - Select joint type
-   - Pick two bodies
-   - Select geometry (face/edge) on each body to define joint frames
-4. **Add forces/torques** if needed
-5. **File → Export**: Save to JSON for your dynamics solver
+3. **Create frames** on the faces, edges, or vertices that form each connection
+4. **Create joints** via Edit → Create Joint:
+   - Select joint type and a frame on each connected body
+   - Choose an axis on each frame for revolute, prismatic, and cylindrical joints, and flip either frame orientation when needed
+   - Choose **Create & Assemble** to solve the assembly, optionally keeping Body 1 fixed, or choose **Create** and run Solve Assembly later
+5. **Add forces/torques** if needed
+6. **File → Export**: Save to JSON for your dynamics solver
 
 ## Project Structure
 
@@ -71,11 +78,17 @@ python main.py
 ├── main.py                 # Application entry point
 ├── core/                   # Core logic
 │   ├── data_structures.py  # RigidBody, Joint, Frame classes
+│   ├── assembly_document.py # Bodies, joints, loads, and revisions
+│   ├── project_store.py    # Versioned .mbdp save and load
+│   ├── transforms.py       # World pose and reference frame
+│   ├── kinematics/         # JAX residual/Jacobian and the LM solver
 │   ├── step_parser.py      # STEP file loading
 │   ├── geometry_utils.py   # Mesh and hull calculations
 │   └── physics_calculator.py
 ├── gui/                    # User interface
 │   ├── viewer_3d.py        # 3D viewport
+│   ├── solve_scheduler.py  # One worker, one pending drag target
+│   ├── application_controller.py
 │   ├── body_tree_widget.py # Body/joint tree panel
 │   ├── property_panel.py   # Properties editor
 │   └── *_dialog.py         # Creation dialogs
@@ -89,17 +102,33 @@ python main.py
 ## Export Format
 
 The exported JSON includes:
-- **Bodies**: Volume, center of mass, inertia tensor, collision hull vertices
-- **Joints**: Type, connected bodies, joint frames in local and global coordinates
+- **Bodies**: Volume, center of mass, inertia tensor, collision hull vertices.
+  `world_pose` is the live placement. `local_frame` is the reference
+  center-of-mass frame from import. Mesh vertices are written in that
+  reference frame.
+- **Joints**: Type and connected bodies, both body-local attachments
+  (`marker1_local`, `marker2_local`), and both attachments transformed by the
+  live body poses (`marker1_world`, `marker2_world`). `frame_world` remains as
+  the legacy creation-frame field.
 - **Forces/Torques**: Magnitude, direction, application point
 - **Motors**: Control type, target values
 
+Project files (`.mbdp`) use schema 2. They store poses, markers, frame
+attachments, motors, forces, torques, and a STEP fingerprint. Schema 1 files
+still open. Poses, markers, motors, and frame parents that version 1 never
+saved are not invented; the load dialog lists those limits.
+
 ## Dependencies
+
+Optional application control through MCP is documented in
+[MCP control setup](Documentation/mcp-control.md). Start with `main.py --enable-mcp`
+to expose the local control bridge; normal startup leaves control disabled.
 
 - [pythonocc-core](https://github.com/tpaviot/pythonocc-core) - CAD kernel (OpenCASCADE wrapper)
 - [PySide6](https://wiki.qt.io/Qt_for_Python) - GUI framework
 - [NumPy](https://numpy.org/) - Numerical computing
-- [SciPy](https://scipy.org/) - Convex hull generation
+- [SciPy](https://scipy.org/) - Convex hull generation and sparse linear prototypes
+- [JAX](https://github.com/jax-ml/jax) - Required kinematic residual and Jacobian evaluation (`jax==0.6.2` on Python 3.10)
 - [trimesh](https://trimesh.org/) - Mesh operations
 
 ## Contributing

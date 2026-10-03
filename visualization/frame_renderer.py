@@ -136,8 +136,12 @@ class FrameRenderer:
             f"(visible: {visible})"
         )
 
-    def update_frame_local_trsf(self, frame_name: str, local_trsf):
-        """Re-apply a body's local transform to an already-rendered frame (e.g. after drag)."""
+    def update_frame_local_trsf(self, frame_name: str, local_trsf, update_viewer: bool = True):
+        """Re-apply a body's local transform to an already-rendered frame.
+
+        ``update_viewer`` is false when a coordinator will request one viewer
+        update for the whole batch.
+        """
         if frame_name not in self.frame_shapes:
             return
         if not hasattr(self, "frame_local_trsf"):
@@ -150,7 +154,8 @@ class FrameRenderer:
                 self.display.Context.Redisplay(shape, False)
             except Exception:
                 pass
-        self.display.Context.UpdateCurrentViewer()
+        if update_viewer:
+            self.display.Context.UpdateCurrentViewer()
     
     def _create_axis(self, origin: np.ndarray, direction: np.ndarray, color: Quantity_Color) -> list:
         """

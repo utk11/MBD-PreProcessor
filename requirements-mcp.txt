@@ -1,0 +1,2 @@
+# Optional adapter dependency; the GUI itself does not import the MCP SDK.
+mcp==1.30.0

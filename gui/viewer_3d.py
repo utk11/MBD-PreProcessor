@@ -15,8 +15,8 @@ from OCC.Core.Quantity import Quantity_Color, Quantity_NOC_BLACK
 from OCC.Core.V3d import V3d_ZBUFFER
 from OCC.Core.TopAbs import TopAbs_FACE, TopAbs_EDGE, TopAbs_VERTEX
 from OCC.Core.TopoDS import TopoDS_Face, TopoDS_Edge, TopoDS_Vertex
-from OCC.Core.gp import gp_Vec
 from core.data_structures import RigidBody
+from gui.drag_projection import screen_drag_delta
 
 
 class SelectableViewer3d(qtViewer3d):
@@ -68,6 +68,7 @@ class SelectableViewer3d(qtViewer3d):
         self._drag_start_screen: Optional[Tuple[int, int]] = None
         self._drag_start_world_pos: Optional[np.ndarray] = None
         self._last_drag_screen: Optional[Tuple[int, int]] = None
+        self.unit_scale = 1.0  # Meters per CAD model unit.
 
         # Currently selected body (set by MainWindow). Left-drag only moves
         # a body when this is set and the press started on that same body.
@@ -87,6 +88,9 @@ class SelectableViewer3d(qtViewer3d):
         self.on_body_drag_start: Optional[Callable[[int], None]] = None
         self.on_body_drag_move: Optional[Callable[[int, np.ndarray], None]] = None  # body_id, new_world_pos (meters)
         self.on_body_drag_end: Optional[Callable[[int], None]] = None
+
+    def set_unit_scale(self, scale: float):
+        self.unit_scale = float(scale)
 
     def set_selection_mode(self, mode: str):
         """
@@ -253,6 +257,8 @@ class SelectableViewer3d(qtViewer3d):
 
         if event.button() == Qt.LeftButton:
             if self._dragging_body_id is not None:
+                # Release may contain a final position without a move event.
+                self._update_body_drag(pt.x(), pt.y(), force=True)
                 self._end_body_drag()
             elif not self._left_moved:
                 # Pure click → selection (or clear selection on empty Body click)
@@ -719,18 +725,18 @@ class SelectableViewer3d(qtViewer3d):
         if self.on_body_drag_start:
             self.on_body_drag_start(body_id)
 
-    def _update_body_drag(self, screen_x: int, screen_y: int):
+    def _update_body_drag(self, screen_x: int, screen_y: int, force: bool = False):
         if self._dragging_body_id is None or self._drag_start_world_pos is None:
             return
 
-        # Small movement threshold to avoid spamming updates on tiny mouse jitter.
+        # The GUI timer and solver queue already coalesce pointer updates.
         if self._last_drag_screen is None:
             self._last_drag_screen = (screen_x, screen_y)
             return
         last_x, last_y = self._last_drag_screen
         dx = screen_x - last_x
         dy = screen_y - last_y
-        if (dx * dx + dy * dy) < 3:   # ~1.7 pixels squared threshold
+        if not force and dx == 0 and dy == 0:
             return
 
         self._last_drag_screen = (screen_x, screen_y)
@@ -754,6 +760,7 @@ class SelectableViewer3d(qtViewer3d):
         self._dragging_body_id = None
         self._drag_start_screen = None
         self._drag_start_world_pos = None
+        self._last_drag_screen = None
 
         if body_id is not None:
             print(f"Finished dragging Body {body_id}")
@@ -764,63 +771,8 @@ class SelectableViewer3d(qtViewer3d):
     def _screen_delta_to_world_delta(self, start_x: int, start_y: int,
                                      curr_x: int, curr_y: int,
                                      ref_world_pos: np.ndarray) -> np.ndarray:
-        """Approximate world-space translation from screen pixel delta (parallel to view plane)."""
-        try:
-            # Projection direction
-            proj = self._display.View.Proj()
-            if isinstance(proj, (list, tuple)):
-                vdir = gp_Vec(proj[0], proj[1], proj[2])
-            else:
-                vdir = gp_Vec(proj.X(), proj.Y(), proj.Z())
-            vdir.Normalize()
-
-            # Up direction
-            up = self._display.View.Up()
-            if isinstance(up, (list, tuple)):
-                upv = gp_Vec(up[0], up[1], up[2])
-            else:
-                upv = gp_Vec(up.X(), up.Y(), up.Z())
-            upv.Normalize()
-
-            # Right vector (screen X)
-            rightv = upv.Crossed(vdir)
-            rightv.Normalize()
-
-            # Re-orthogonalize up (screen Y)
-            upv = vdir.Crossed(rightv)
-            upv.Normalize()
-
-            right = np.array([rightv.X(), rightv.Y(), rightv.Z()])
-            up = np.array([upv.X(), upv.Y(), upv.Z()])
-
-            # World units per pixel at the reference point.
-            # Use view size heuristic (robust across pythonocc versions).
-            # Size() usually gives a measure related to the view width in world units.
-            try:
-                view_size = float(self._display.View.Size())
-                if view_size < 1e-6:
-                    view_size = 1.0
-                w = max(float(self.width()), 1.0)
-                world_per_pixel = (view_size * 2.0) / w
-            except Exception:
-                world_per_pixel = 0.001
-
-            # Optional sensitivity tweak: for many assemblies this feels good.
-            # Increase if drag feels too slow, decrease if too fast.
-            # Tweak this value if movement feels "clunky" or too sensitive.
-            world_per_pixel *= 0.8
-
-            dx = float(curr_x - start_x) * world_per_pixel
-            dy = float(curr_y - start_y) * world_per_pixel
-
-            # Screen +Y is downward → negate for world up
-            delta = right * dx - up * dy
-            return delta
-        except Exception as e:
-            print("Drag delta error, using fallback:", e)
-            scale = 0.001
-            return np.array([
-                scale * (curr_x - start_x),
-                -scale * (curr_y - start_y),
-                0.0
-            ])
+        """Exact camera displacement on the view plane through the initial pose."""
+        return screen_drag_delta(
+            self._display.View, (start_x, start_y), (curr_x, curr_y),
+            ref_world_pos, self.unit_scale, float(self.devicePixelRatioF()),
+        )
