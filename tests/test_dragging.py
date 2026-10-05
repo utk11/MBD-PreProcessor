@@ -128,7 +128,7 @@ def scale_scene(bodies, joints, state, scale):
 
 class ConstrainedDragTests(unittest.TestCase):
     def test_small_mechanism_follows_reachable_targets_in_one_request(self):
-        for strategy in ("dense", "superlu", "lsmr"):
+        for strategy in ("dense", "superlu", "lsmr", "cg"):
             with self.subTest(strategy=strategy):
                 bodies, joints, state = build_pendulum(False)
                 scale_scene(bodies, joints, state, 0.02)

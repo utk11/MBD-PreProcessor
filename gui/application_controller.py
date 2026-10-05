@@ -16,6 +16,7 @@ from core.kinematics.reports import RevisionStamp, SolveReport, commit_poses
 from core.kinematics.solver import SolveRequest
 from core.transforms import body_world_pose
 from gui.solve_scheduler import SolveIntent, SolveScheduler, result_is_acceptable
+from gui.solver_selector import SOLVER_CHOICES
 from visualization.coordinator import RendererCoordinator
 
 
@@ -31,6 +32,7 @@ class ApplicationController(QObject):
         super().__init__(window)
         self.window = window
         self.document = window.document
+        self.linear_solver_name = "dense"
         self.coordinator: Optional[RendererCoordinator] = None
         self.scheduler = SolveScheduler(
             build_request=self._build_request,
@@ -62,6 +64,25 @@ class ApplicationController(QObject):
 
     def on_topology_changed(self) -> None:
         """Connectivity changed. In-flight results carry the old topology revision."""
+        if self.document.joints:
+            self.scheduler.request_prewarm()
+
+    def set_linear_solver(self, name: str) -> None:
+        """Snapshot the selection into future requests and discard older work."""
+        key = str(name).strip().lower()
+        labels = dict(SOLVER_CHOICES)
+        if key not in labels:
+            raise ValueError(f"Unknown linear solver: {name!r}")
+        if key == self.linear_solver_name:
+            return
+        self.linear_solver_name = key
+        pending = self.scheduler.queue.pending
+        if pending is not None:
+            self._silent_requests.discard(pending.request_id)
+            self._require_feasible_requests.discard(pending.request_id)
+            self._locked_body_ids_by_request.pop(pending.request_id, None)
+        self.scheduler.reset_document()
+        self._set_status(f"Linear solver: {labels[key]} (dragging and Solve Assembly)")
         if self.document.joints:
             self.scheduler.request_prewarm()
 
@@ -161,6 +182,7 @@ class ApplicationController(QObject):
             pin_orientation=False,
             analyze=intent.kind in ("assembly", "diagnose"),
             locked_body_ids=self._locked_body_ids_by_request.get(intent.request_id, ()),
+            linear_solver=self.linear_solver_name,
         )
 
     def _on_result(self, report: SolveReport) -> bool:
@@ -169,6 +191,11 @@ class ApplicationController(QObject):
         require_feasible = report.request_id in self._require_feasible_requests
         self._require_feasible_requests.discard(report.request_id)
         self._locked_body_ids_by_request.pop(report.request_id, None)
+        # Changing the solver cancels older work, including preparation and
+        # assembly notifications. An in-flight request finishes on the worker.
+        if (int(report.epoch) != int(self.scheduler.queue.epoch)
+                or int(report.document_generation) != int(self.document.generation)):
+            return False
         if report.kind == "prewarm":
             if report.finite:
                 self._set_status("Solver ready")

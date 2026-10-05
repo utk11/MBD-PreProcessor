@@ -50,8 +50,8 @@ https://www.linkedin.com/posts/utkarsh-kulkarni-737a21143_python-mbd-simulation-
    JAX evaluates joint residuals and Jacobians. This environment is Python 3.10,
    so the pin is `jax==0.6.2` (`jax==0.11.2` requires Python 3.12). The app
    exits with an install message if JAX is missing. It does not fall back to
-   another solver. The Levenberg-Marquardt loop and the dense linear step stay
-   in NumPy.
+   another evaluator. The shared Levenberg-Marquardt loop uses NumPy; its
+   selectable linear methods use NumPy and SciPy.
 
 ## Usage
 
@@ -59,6 +59,13 @@ Run the application:
 ```bash
 python main.py
 ```
+
+Use the **Linear solver** dropdown above the viewer to choose **Dense (default)**,
+**SuperLU**, **Conjugate Gradient (CG)**, or **LSMR**. Your selection applies to
+both body dragging and **Assembly → Solve Assembly** (`Ctrl+K`). Switching keeps
+the current body poses and the warmed JAX evaluator; any unfinished solve with
+the previous method is discarded. The selection lasts for the current app
+session, including when you load another project.
 
 ### Basic Workflow
 

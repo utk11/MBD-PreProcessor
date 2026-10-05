@@ -8,7 +8,7 @@ Conjugate gradient applies ``J.T @ (J @ v) + lambda * D * v`` and does not
 allocate the normal matrix.
 
 Patterns are built from endpoint blocks and scatter columns. Duplicate
-contributions are accumulated into the cached CSR layout. Locked endpoints
+contributions are accumulated by the COO constructor. Locked endpoints
 (negative scatter columns) are omitted. Pin rows are included. The dense
 normal workspace is not used.
 """
@@ -30,15 +30,6 @@ class _Pattern:
         self.cols = cols
         self.nrows = nrows
         self.ncols = ncols
-        # Canonical CSR layout is topology-only. Reuse it across numerical fills,
-        # including duplicate endpoint contributions and changing zero values.
-        keys = rows.astype(np.int64) * ncols + cols
-        unique, self.inverse = np.unique(keys, return_inverse=True)
-        self.order = np.argsort(keys, kind="stable")
-        self.duplicates = unique.size != keys.size
-        self.indices = (unique % max(ncols, 1)).astype(np.int32)
-        counts = np.bincount(unique // max(ncols, 1), minlength=nrows)
-        self.indptr = np.r_[0, np.cumsum(counts)].astype(np.int32)
 
 
 def _pattern_key(plan, model, n_joint_rows: int, pin_column: Optional[int], pin_width: int):
@@ -94,7 +85,7 @@ def _fill_data(
     pin_width: int,
     pin_sqrt: float,
 ) -> np.ndarray:
-    chunks = []
+    data = []
     indices = np.asarray(plan.joint_indices, dtype=np.int32).tolist()
     for local, joint_index in enumerate(indices):
         width = int(model.n_rows[joint_index])
@@ -102,30 +93,15 @@ def _fill_data(
             col0 = int(plan.scatter_col[local, endpoint])
             if col0 < 0:
                 continue
-            chunks.append(blocks[joint_index, endpoint, :width, :].ravel() * float(joint_weight))
+            block = blocks[joint_index, endpoint]
+            for row in range(width):
+                for column in range(6):
+                    data.append(float(joint_weight) * float(block[row, column]))
     if pin_width and pin_column is not None:
-        signs = np.ones(int(pin_width), dtype=np.float64)
-        signs[3:] = -1.0
-        chunks.append(signs * float(pin_sqrt))
-    return np.concatenate(chunks) if chunks else np.zeros(0, dtype=np.float64)
-
-
-def _cached_pattern(strategy, plan, model, n_joint_rows, pin_column, pin_width):
-    """Retain both pinned and joint-only layouts used during drag correction."""
-    key = _pattern_key(plan, model, n_joint_rows, pin_column, pin_width)
-    if key == strategy._key:
-        return strategy._pattern
-    cache = getattr(strategy, "_patterns", None)
-    if cache is None:
-        cache = strategy._patterns = {}
-    pattern = cache.get(key)
-    if pattern is None:
-        pattern = _build_pattern(plan, model, n_joint_rows, pin_column, pin_width)
-        if len(cache) >= 4:
-            del cache[next(iter(cache))]
-        cache[key] = pattern
-    strategy._key = key
-    return pattern
+        for row in range(int(pin_width)):
+            sign = 1.0 if row < 3 else -1.0
+            data.append(sign * float(pin_sqrt))
+    return np.asarray(data, dtype=np.float64)
 
 
 def assemble_weighted_coo(
@@ -139,21 +115,18 @@ def assemble_weighted_coo(
     pin_sqrt: float,
     pattern: Optional[_Pattern] = None,
 ) -> Tuple[sp.csr_matrix, _Pattern]:
-    """Fill a cached CSR layout, summing repeated endpoint contributions.
-
-    The historical name is retained for callers. CSR arrays belong to the
-    returned matrix, so pruning zeros cannot damage the next pattern refill.
-    """
+    """Build the weighted Jacobian, summing repeated endpoint contributions."""
     if pattern is None:
         pattern = _build_pattern(plan, model, n_joint_rows, pin_column, pin_width)
     data = _fill_data(plan, model, blocks, joint_weight, pin_column, pin_width, pin_sqrt)
-    if pattern.duplicates:
-        canonical = np.bincount(pattern.inverse, weights=data, minlength=pattern.indices.size)
+    if pattern.rows.size == 0:
+        matrix = sp.csr_matrix((pattern.nrows, pattern.ncols), dtype=np.float64)
     else:
-        canonical = data[pattern.order]
-    matrix = sp.csr_matrix((canonical, pattern.indices.copy(), pattern.indptr.copy()),
-                           shape=(pattern.nrows, pattern.ncols))
-    matrix.eliminate_zeros()
+        matrix = sp.coo_matrix(
+            (data, (pattern.rows, pattern.cols)),
+            shape=(pattern.nrows, pattern.ncols),
+            dtype=np.float64,
+        ).tocsr()
     return matrix, pattern
 
 
@@ -163,8 +136,7 @@ def _normal_diagonal(jacobian: sp.csr_matrix) -> np.ndarray:
     return np.maximum(diagonal, DIAG_FLOOR)
 
 
-def _failed(reason: str, delta_out: np.ndarray, ncols: int, *,
-            iterations: Optional[int] = None, factorization: str = "") -> StepResult:
+def _failed(reason: str, delta_out: np.ndarray, ncols: int) -> StepResult:
     if ncols and delta_out.shape[0] >= ncols:
         delta_out[:ncols] = 0.0
     return StepResult(
@@ -172,8 +144,7 @@ def _failed(reason: str, delta_out: np.ndarray, ncols: int, *,
         used_lstsq=False,
         finite=False,
         linear_residual=float("inf"),
-        iterations=iterations,
-        factorization=factorization,
+        factorization="",
         failure_reason=reason,
     )
 
@@ -204,7 +175,10 @@ class SuperLUNormalStrategy:
         pin_sqrt: float,
         delta_out: np.ndarray,
     ) -> StepResult:
-        self._pattern = _cached_pattern(self, plan, model, n_joint_rows, pin_column, pin_width)
+        key = _pattern_key(plan, model, n_joint_rows, pin_column, pin_width)
+        if key != self._key:
+            self._pattern = _build_pattern(plan, model, n_joint_rows, pin_column, pin_width)
+            self._key = key
         jacobian, self._pattern = assemble_weighted_coo(
             plan, model, blocks, joint_weight, n_joint_rows,
             pin_column, pin_width, pin_sqrt, self._pattern,
@@ -218,13 +192,11 @@ class SuperLUNormalStrategy:
                 f"Residual length {residual.shape[0]} does not match Jacobian rows {jacobian.shape[0]}.",
                 delta_out, ncols,
             )
-        transpose = jacobian.T
-        normal = (transpose @ jacobian).tocsc()
-        raw_diagonal = normal.diagonal()
-        diagonal = np.maximum(raw_diagonal, DIAG_FLOOR)
-        normal.setdiag(raw_diagonal + float(damping) * diagonal)
+        diagonal = _normal_diagonal(jacobian)
+        normal = (jacobian.T @ jacobian).tocsc()
+        normal = normal + sp.diags(float(damping) * diagonal, format="csc")
         self.fill_nnz = int(normal.nnz)
-        rhs = -(transpose @ np.asarray(residual, dtype=np.float64))
+        rhs = -(jacobian.T @ np.asarray(residual, dtype=np.float64))
         try:
             factor = spla.splu(normal)
             solved = np.asarray(factor.solve(np.asarray(rhs, dtype=np.float64)), dtype=np.float64).reshape(ncols)
@@ -259,7 +231,10 @@ class AugmentedLSMRStrategy:
         pin_sqrt: float,
         delta_out: np.ndarray,
     ) -> StepResult:
-        self._pattern = _cached_pattern(self, plan, model, n_joint_rows, pin_column, pin_width)
+        key = _pattern_key(plan, model, n_joint_rows, pin_column, pin_width)
+        if key != self._key:
+            self._pattern = _build_pattern(plan, model, n_joint_rows, pin_column, pin_width)
+            self._key = key
         jacobian, self._pattern = assemble_weighted_coo(
             plan, model, blocks, joint_weight, n_joint_rows,
             pin_column, pin_width, pin_sqrt, self._pattern,
@@ -274,27 +249,16 @@ class AugmentedLSMRStrategy:
                 f"Residual length {residual.shape[0]} does not match Jacobian rows {jacobian.shape[0]}.",
                 delta_out, ncols,
             )
-        column_sum = np.asarray(jacobian.multiply(jacobian).sum(axis=0)).ravel()
-        diagonal = np.maximum(column_sum, DIAG_FLOOR)
-        damp = float(damping) * diagonal
-        # Right scaling is an invertible change of variables x = scale * y.
-        # It preserves the original damped problem, including its free columns.
-        scale = 1.0 / np.sqrt(np.maximum(column_sum + damp, 1e-30))
-        scaled_jacobian = jacobian.multiply(scale).tocsr()
-        damp_rows = sp.diags(np.sqrt(damp) * scale, format="csr")
-        augmented = sp.vstack([scaled_jacobian, damp_rows], format="csr")
-        transpose = augmented.T
-        # Supply the transpose explicitly once: SciPy's default sparse wrapper
-        # otherwise goes through matmat on every bidiagonalization iteration.
-        operator = spla.LinearOperator(augmented.shape, matvec=augmented.dot,
-                                       rmatvec=transpose.dot, dtype=np.float64)
+        diagonal = _normal_diagonal(jacobian)
+        damp_rows = sp.diags(np.sqrt(float(damping)) * np.sqrt(diagonal), format="csr")
+        augmented = sp.vstack([jacobian, damp_rows], format="csr")
         right_hand = np.concatenate([
             -np.asarray(residual, dtype=np.float64),
             np.zeros(ncols, dtype=np.float64),
         ])
         try:
-            solved, istop, iterations, _norm_r, *_rest = spla.lsmr(
-                operator,
+            solved, istop, iterations, norm_r, *_rest = spla.lsmr(
+                augmented,
                 right_hand,
                 atol=1e-12,
                 btol=1e-12,
@@ -302,19 +266,17 @@ class AugmentedLSMRStrategy:
             )
         except Exception as exc:
             return _failed(f"LSMR failed: {exc}", delta_out, ncols)
-        solved = np.asarray(solved, dtype=np.float64).reshape(ncols) * scale
+        solved = np.asarray(solved, dtype=np.float64).reshape(ncols)
         # 0 is an exact zero solution. 1 and 2 meet atol/btol. 4 and 5 are
         # the same tests at machine precision. 7 is the iteration cap.
         if int(istop) not in (0, 1, 2, 4, 5) or not np.isfinite(solved).all():
-            return _failed(f"LSMR stopped with istop={int(istop)}", delta_out, ncols,
-                           iterations=int(iterations), factorization="lsmr-augmented")
+            return _failed(f"LSMR stopped with istop={int(istop)}", delta_out, ncols)
         delta_out[:ncols] = solved
-        normal_residual = jacobian.T @ (jacobian @ solved + residual) + damp * solved
         return StepResult(
             step_norm=float(np.linalg.norm(solved)),
             used_lstsq=True,
             finite=True,
-            linear_residual=float(np.linalg.norm(normal_residual)),
+            linear_residual=float(norm_r),
             iterations=int(iterations),
             factorization="lsmr-augmented",
             failure_reason="",
@@ -326,20 +288,17 @@ class CgNormalStrategy:
 
     The weighted sparse Jacobian is assembled once. The normal matrix is not.
     ``preconditioner`` is ``jacobi`` or ``block`` (6-by-6 body Jacobi).
-    Jacobi is the registered default. The iteration budget scales with the
-    number of unknowns; hitting it is a failed step, never a partial solution.
+    Jacobi is the registered default: it matches the dense step on a chain
+    of 64, and the block preconditioner does not.
     """
 
     name = "cg"
     uses_blocks = True
 
-    def __init__(self, preconditioner: str = "jacobi", maxiter: Optional[int] = None):
+    def __init__(self, preconditioner: str = "jacobi"):
         if preconditioner not in ("jacobi", "block"):
             raise ValueError("CG preconditioner must be 'jacobi' or 'block'.")
         self.preconditioner = preconditioner
-        if maxiter is not None and maxiter <= 0:
-            raise ValueError("CG maxiter must be positive.")
-        self.maxiter = maxiter
         self._key = None
         self._pattern: Optional[_Pattern] = None
         self.fill_nnz = 0
@@ -359,7 +318,10 @@ class CgNormalStrategy:
         pin_sqrt: float,
         delta_out: np.ndarray,
     ) -> StepResult:
-        self._pattern = _cached_pattern(self, plan, model, n_joint_rows, pin_column, pin_width)
+        key = _pattern_key(plan, model, n_joint_rows, pin_column, pin_width)
+        if key != self._key:
+            self._pattern = _build_pattern(plan, model, n_joint_rows, pin_column, pin_width)
+            self._key = key
         jacobian, self._pattern = assemble_weighted_coo(
             plan, model, blocks, joint_weight, n_joint_rows,
             pin_column, pin_width, pin_sqrt, self._pattern,
@@ -379,13 +341,12 @@ class CgNormalStrategy:
         column_sum = np.asarray(squared.sum(axis=0)).ravel()
         diagonal = np.maximum(column_sum, DIAG_FLOOR)
         prec_diag = column_sum + float(damping) * diagonal
-        transpose = jacobian.T
-        rhs = -(transpose @ np.asarray(residual, dtype=np.float64))
+        rhs = -(jacobian.T @ np.asarray(residual, dtype=np.float64))
         damp = float(damping) * diagonal
 
         def matvec(vector):
             values = np.asarray(vector, dtype=np.float64)
-            return transpose @ (jacobian @ values) + damp * values
+            return jacobian.T @ (jacobian @ values) + damp * values
 
         operator = spla.LinearOperator((ncols, ncols), matvec=matvec, dtype=np.float64)
         apply = _cg_preconditioner(
@@ -403,7 +364,7 @@ class CgNormalStrategy:
                 np.asarray(rhs, dtype=np.float64),
                 rtol=1e-10,
                 atol=1e-12,
-                maxiter=self.maxiter if self.maxiter is not None else max(4 * ncols, 64),
+                maxiter=min(4 * ncols, 500),
                 M=preconditioner,
                 callback=counted,
             )
@@ -411,8 +372,7 @@ class CgNormalStrategy:
             return _failed(f"CG failed: {exc}", delta_out, ncols)
         solved = np.asarray(solved, dtype=np.float64).reshape(ncols)
         if int(info) != 0 or not np.isfinite(solved).all():
-            return _failed(f"CG stopped with info={int(info)}", delta_out, ncols,
-                           iterations=int(iterations["count"]), factorization=label)
+            return _failed(f"CG stopped with info={int(info)}", delta_out, ncols)
         delta_out[:ncols] = solved
         linear_residual = float(np.linalg.norm(matvec(solved) - rhs))
         return StepResult(

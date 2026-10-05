@@ -35,7 +35,7 @@ def _ensure_pyside6_qt_plugins() -> None:
 _ensure_pyside6_qt_plugins()
 
 from PySide6.QtWidgets import (QApplication, QMainWindow, QWidget, QVBoxLayout,
-                                QFileDialog, QMenuBar, QMessageBox, QSplitter, QDialog)
+                                QFileDialog, QMenuBar, QMessageBox, QSplitter, QDialog, QLabel)
 from PySide6.QtCore import Qt, QTimer, QThread, Signal
 from PySide6.QtGui import QAction
 from typing import List, Optional, Dict, Tuple
@@ -72,6 +72,7 @@ from gui.force_dialog import ForceDialog
 from gui.torque_dialog import TorqueDialog
 from gui.motor_dialog import MotorDialog
 from gui.application_controller import ApplicationController
+from gui.solver_selector import SolverSelector
 
 # Import visualization modules
 from visualization.body_renderer import BodyRenderer
@@ -342,6 +343,7 @@ class MainWindow(QMainWindow):
         self.controller = ApplicationController(self)
         self.controller.attach_viewer()
         self.controller.scheduler.shutdown_finished.connect(self._finish_close_if_ready)
+        self.create_solver_toolbar()
 
         print("Application initialized successfully!")
         print("Viewer ready. Use File > Open to load a STEP file.")
@@ -493,6 +495,18 @@ class MainWindow(QMainWindow):
         test_joint_action = QAction("Create Test Joint", self)
         test_joint_action.triggered.connect(self.create_test_joint)
         debug_menu.addAction(test_joint_action)
+
+    def create_solver_toolbar(self):
+        """Keep the active method visible while comparing drag responsiveness."""
+        solver_toolbar = self.addToolBar("Solver")
+        solver_toolbar.setObjectName("solverToolbar")
+        solver_toolbar.setMovable(False)
+        solver_toolbar.addWidget(QLabel("  Linear solver: ", solver_toolbar))
+        self.solver_selector = SolverSelector(solver_toolbar)
+        solver_toolbar.addWidget(self.solver_selector)
+        self.solver_selector.currentIndexChanged.connect(
+            lambda _index: self.controller.set_linear_solver(self.solver_selector.currentData())
+        )
 
     def open_step_file(self):
         """Open file dialog and load selected STEP file"""
@@ -2150,7 +2164,7 @@ class MainWindow(QMainWindow):
 
 
 def _require_jax():
-    """JAX evaluates the kinematic residual. There is no other solver."""
+    """Require the shared JAX residual/Jacobian evaluator for all linear methods."""
     try:
         import jax  # noqa: F401
         import jaxlib  # noqa: F401

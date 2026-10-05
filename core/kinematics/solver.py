@@ -60,6 +60,7 @@ class SolveRequest:
     pin_orientation: bool = False
     analyze: bool = False
     locked_body_ids: Tuple[int, ...] = ()
+    linear_solver: Optional[str] = None
 
 
 class KinematicSolver:
@@ -104,6 +105,15 @@ class KinematicSolver:
             dense_linear=not getattr(self.linear_strategy, "uses_blocks", False),
         )
         return self._workspace
+
+    def set_linear_solver(self, name: str) -> None:
+        """Switch linear methods while retaining prepared data and JAX kernels."""
+        key = str(name).strip().lower()
+        if key == self.linear_solver_name:
+            return
+        strategy = make_linear_strategy(key)
+        self.linear_strategy = strategy
+        self.linear_solver_name = key
 
     def release(self) -> None:
         """Drop this session's prepared data and compiled-function references."""
@@ -201,6 +211,8 @@ class KinematicSolver:
 
     def solve_request(self, request: SolveRequest) -> SolveReport:
         """Solve from an owned snapshot. Does not write a live ``State``."""
+        if request.linear_solver is not None:
+            self.set_linear_solver(request.linear_solver)
         self.bodies = list(request.bodies)
         self.joints = list(request.joints)
         self.ground_pose = (

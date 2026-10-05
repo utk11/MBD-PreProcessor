@@ -275,7 +275,8 @@ class SolveScheduler(QObject):
             return
         finished = self.queue.active
         self.queue.active = None
-        if finished is not None and finished.kind == "assembly":
+        if (finished is not None and finished.kind == "assembly"
+                and finished.epoch == self.queue.epoch):
             self.queue.drag_suspended = False
         accepted = False
         try:

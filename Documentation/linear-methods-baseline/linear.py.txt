@@ -18,7 +18,6 @@ from dataclasses import dataclass
 from typing import Optional
 
 import numpy as np
-import scipy.linalg as la
 
 
 DIAG_FLOOR = 1e-12
@@ -63,39 +62,25 @@ def solve_dense_damped(
     # factorization sees the same dense system the legacy solver builds.
     packed_j = np.ascontiguousarray(jacobian, dtype=np.float64)
     packed_r = np.ascontiguousarray(residual, dtype=np.float64)
-    nrm = normal[:ncols, :ncols] if normal.shape[0] >= ncols else np.empty((ncols, ncols))
-    grd = gradient[:ncols] if gradient.shape[0] >= ncols else np.empty(ncols)
-    np.matmul(packed_j.T, packed_j, out=nrm)
-    np.matmul(packed_j.T, packed_r, out=grd)
+    nrm = packed_j.T @ packed_j
+    grd = packed_j.T @ packed_r
+    if normal.shape[0] >= ncols:
+        normal[:ncols, :ncols] = nrm
+    if gradient.shape[0] >= ncols:
+        gradient[:ncols] = grd
     diag = np.diag(nrm).copy()
     np.maximum(diag, DIAG_FLOOR, out=diag)
-    sys = system[:ncols, :ncols] if system.shape[0] >= ncols else np.empty_like(nrm)
-    np.copyto(sys, nrm)
+    sys = nrm.copy()
     diag_index = np.arange(ncols)
     sys[diag_index, diag_index] += damping * diag
+    if system.shape[0] >= ncols:
+        system[:ncols, :ncols] = sys
     used_lstsq = False
-    # LAPACK call overhead wins on tiny matrices; Cholesky pays off as size grows.
-    factorization = "dense-lu" if ncols <= 32 else "dense-cholesky"
     try:
-        # Positive damping makes this symmetric normal system positive definite.
-        # Keep sys intact for the residual and preserve the singular fallback.
-        if ncols <= 32:
-            if not np.isfinite(sys).all():
-                raise ValueError("Non-finite dense system")
-            solved = np.linalg.solve(sys, -grd)
-        else:
-            solved = la.cho_solve(la.cho_factor(sys, lower=True), -grd)
+        solved = np.linalg.solve(sys, -grd)
     except np.linalg.LinAlgError:
-        factorization = "dense-lu"
-        try:
-            solved = np.linalg.solve(sys, -grd)
-        except np.linalg.LinAlgError:
-            solved = np.linalg.lstsq(sys, -grd, rcond=None)[0]
-            used_lstsq = True
-            factorization = "dense-lstsq"
-    except ValueError:
-        # SciPy rejects NaN/Inf before factorization; return the usual failure.
-        solved = np.full(ncols, np.nan)
+        solved = np.linalg.lstsq(sys, -grd, rcond=None)[0]
+        used_lstsq = True
     out = delta[:ncols]
     out[:] = solved
     finite = bool(np.isfinite(out).all())
@@ -110,7 +95,7 @@ def solve_dense_damped(
         finite=finite,
         linear_residual=linear_residual,
         iterations=1,
-        factorization=factorization,
+        factorization="dense-lstsq" if used_lstsq else "dense-lu",
         failure_reason="" if finite else "Dense step was not finite",
     )
 

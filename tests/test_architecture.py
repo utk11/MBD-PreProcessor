@@ -365,11 +365,40 @@ class SparseLinearTests(unittest.TestCase):
         ):
             dense_step, seconds = _one_linear_step(builder, "dense")
             timings[name] = {"dense": seconds}
-            for strategy in ("superlu", "lsmr"):
+            for strategy in ("superlu", "lsmr", "cg"):
                 other, seconds = _one_linear_step(builder, strategy)
                 timings[name][strategy] = seconds
                 np.testing.assert_allclose(other, dense_step, atol=1e-8, rtol=1e-8)
         print("SPARSE_TIMING", json.dumps(timings))
+
+    def test_cg_assembly_matches_dense(self):
+        for name, builder in (("pendulum", build_pendulum), ("four_bar", build_four_bar)):
+            with self.subTest(name=name):
+                dense_bodies, dense_joints, dense_state = builder(True)
+                cg_bodies, cg_joints, cg_state = builder(True)
+                dense = KinematicSolver(
+                    dense_bodies, dense_joints, dense_state, diagnostics="off", linear_solver="dense",
+                )
+                cg = KinematicSolver(
+                    cg_bodies, cg_joints, cg_state, diagnostics="off", linear_solver="cg",
+                )
+                try:
+                    dense_report = dense.solve_assembly(max_iters=50, tol=1e-9, analyze=False)
+                    cg_report = cg.solve_assembly(max_iters=50, tol=1e-9, analyze=False)
+                    self.assertTrue(dense_report.finite and cg_report.finite)
+                    self.assertEqual(dense_report.iterations, cg_report.iterations)
+                    self.assertEqual(dense_report.converged, cg_report.converged)
+                    self.assertEqual(dense_report.converged, True)
+                    for body in dense_bodies:
+                        dense_pose = dense_state.get_body_pose(body.id)
+                        cg_pose = cg_state.get_body_pose(body.id)
+                        np.testing.assert_allclose(cg_pose.origin, dense_pose.origin, atol=1e-6, rtol=1e-6)
+                        np.testing.assert_allclose(
+                            cg_pose.rotation_matrix, dense_pose.rotation_matrix, atol=1e-6, rtol=1e-6,
+                        )
+                finally:
+                    dense.release()
+                    cg.release()
 
 
 def _one_linear_step(builder, strategy_name):

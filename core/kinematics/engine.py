@@ -36,6 +36,13 @@ _ACCEPT_REL = 1e-8
 _DRAG_MAX_ROTATION = 0.1  # Radians per trial; preserve the local linkage branch.
 
 
+def _record_linear_work(trace: PhaseTrace, step) -> None:
+    """Count primary and drag-correction solves, including failed iterations."""
+    trace.linear_solves += 1
+    trace.linear_iterations += int(step.iterations or 0)
+    trace.linear_failures += int(not step.finite)
+
+
 @dataclass
 class EngineResult:
     report: SolveReport
@@ -179,6 +186,7 @@ def _correct_drag_trial(evaluator, model, workspace, plan, options, trace):
                 workspace.jacobian[:nrows, :ncols], workspace.weighted[:nrows], _LAM_MIN,
                 workspace.normal, workspace.gradient, workspace.delta, workspace.system,
             )
+        _record_linear_work(trace, step)
         if not step.finite:
             return
         for index, slot in enumerate(plan.movable_slots):
@@ -347,6 +355,7 @@ def _solve_plan(
                     workspace.delta,
                     workspace.system,
                 )
+        _record_linear_work(trace, step)
         trace.linear_residual = float(getattr(step, "linear_residual", 0.0))
         trace.linear_solver = str(getattr(step, "factorization", ""))
         if getattr(step, "failure_reason", ""):

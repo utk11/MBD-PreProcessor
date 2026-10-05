@@ -36,6 +36,9 @@ class PhaseTrace:
     compile_s: float = 0.0
     linear_residual: float = 0.0
     linear_solver: str = ""
+    linear_solves: int = 0
+    linear_iterations: int = 0
+    linear_failures: int = 0
     failure_reason: str = ""
 
     @contextmanager

@@ -244,7 +244,7 @@ class SparseWorkspaceTests(unittest.TestCase):
         validate_workspace(dense)
 
     def test_sparse_full_solve_drag_and_diagnostics_need_no_persistent_dense_matrices(self):
-        for strategy in ("superlu", "lsmr"):
+        for strategy in ("superlu", "lsmr", "cg"):
             with self.subTest(strategy=strategy):
                 bodies, joints, state = build_pendulum(True)
                 solver = KinematicSolver(bodies, joints, state, linear_solver=strategy)
